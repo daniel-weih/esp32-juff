@@ -2,6 +2,10 @@
 
 [简体中文](README.md) · [Architecture](docs/architecture.md) · [Firmware](firmware/README.md) · [Contributing](CONTRIBUTING.md)
 
+![JUFF interface concept running on the ESP32-S3-Touch-LCD-3.5](docs/images/juff-hero.png)
+
+*Concept rendering based on the target development board and JUFF firmware UI.*
+
 JUFF turns the Waveshare **ESP32-S3-Touch-LCD-3.5** into a touch-enabled,
 real-time voice terminal. Its default transport is encrypted Bluetooth LE:
 the ESP32 streams microphone audio to a Mac, `qwen-audio-agent` talks to

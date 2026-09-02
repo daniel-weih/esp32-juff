@@ -2,6 +2,10 @@
 
 [English](README.en.md) · [架构](docs/architecture.md) · [固件说明](firmware/README.md) · [参与贡献](CONTRIBUTING.md)
 
+![JUFF 运行在 ESP32-S3-Touch-LCD-3.5 上的界面效果图](docs/images/juff-hero.png)
+
+*基于目标开发板外观与 JUFF 固件界面生成的效果图。*
+
 JUFF 把 Waveshare **ESP32-S3-Touch-LCD-3.5** 变成一个带屏幕、触摸、
 麦克风和扬声器的实时语音终端。默认链路是加密 Bluetooth LE：
 ESP32 将麦克风音频送到 Mac，Mac 上的
