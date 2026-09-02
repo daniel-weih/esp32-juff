@@ -24,6 +24,6 @@
   },
   "dependencies": {
     "qwen-audio-agent": "1.11.0",
-    "ws": "8.21.1"
+    "ws": "8.21.3"
   }
 }
