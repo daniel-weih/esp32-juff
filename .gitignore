@@ -1,0 +1,40 @@
+# macOS and editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+host/.env
+*.key
+*.pem
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Node.js
+node_modules/
+npm-debug.log*
+coverage/
+
+# ESP-IDF and local toolchains
+.tools/
+firmware/build/
+firmware/managed_components/
+firmware/sdkconfig
+firmware/sdkconfig.old
+
+# macOS build output
+macos/build/
+DerivedData/
+
+# Local artifacts and device backups
+backups/
+dist/
+tmp/

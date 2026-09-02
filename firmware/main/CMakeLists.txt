@@ -1,0 +1,29 @@
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "audio_io.c"
+        "ble_manager.c"
+        "board_display.c"
+        "device_client.c"
+        "usb_provisioning.c"
+        "wifi_manager.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        bt
+        esp_event
+        esp_netif
+        esp_wifi
+        esp_codec_dev
+        esp_lcd
+        esp_websocket_client
+        json
+        lvgl
+        nvs_flash
+        spi_flash
+        esp_driver_gpio
+        esp_driver_i2c
+        esp_driver_i2s
+        esp_driver_ledc
+        esp_driver_spi
+        esp_timer
+)

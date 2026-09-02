@@ -1,0 +1,29 @@
+{
+  "name": "juff-host",
+  "version": "0.5.0",
+  "private": true,
+  "type": "module",
+  "description": "Mac host services for the JUFF ESP32-S3 Qwen voice companion.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0",
+    "npm": ">=10"
+  },
+  "scripts": {
+    "start": "node --env-file=.env src/run.mjs",
+    "bridge": "node --env-file=.env src/index.mjs",
+    "test": "node --test",
+    "ble:build": "../scripts/build_macos_ble.sh",
+    "ble:test": "../macos/build/JuffBLE.app/Contents/MacOS/JuffBLE --self-test",
+    "doctor": "../scripts/doctor_macos.sh",
+    "ble:provision": "python3 ../scripts/provision_ble.py",
+    "qwen": "qwenaudio",
+    "qwen:config": "qwenaudio config",
+    "qwen:setup": "qwenaudio setup",
+    "qwen:gateway": "qwenaudio"
+  },
+  "dependencies": {
+    "qwen-audio-agent": "1.11.0",
+    "ws": "8.21.1"
+  }
+}

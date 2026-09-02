@@ -1,0 +1,51 @@
+name: Bug report
+description: Report a reproducible problem with JUFF.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: Do not paste API keys, Wi-Fi passwords, device tokens, or bonding data.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport
+      options:
+        - Bluetooth LE
+        - Wi-Fi/WebSocket
+        - USB provisioning
+        - Not transport-related
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: JUFF version or commit
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Board and macOS version
+      placeholder: ESP32-S3-Touch-LCD-3.5; macOS version
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Include relevant `make doctor` output or logs after removing secrets.

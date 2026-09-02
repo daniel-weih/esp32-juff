@@ -1,0 +1,113 @@
+menu "Juff voice terminal"
+
+    config JUFF_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+        help
+            Leave empty to build a safe USB-only diagnostic image.
+
+    config JUFF_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+
+    config JUFF_BRIDGE_URI
+        string "Host bridge WebSocket URI"
+        default "ws://192.168.1.2:8765/device"
+        help
+            Use the LAN IP of the computer running the bridge, not 127.0.0.1.
+
+    config JUFF_DEVICE_TOKEN
+        string "Device authentication token"
+        default ""
+        help
+            Configure this through encrypted BLE or USB provisioning. It must
+            exactly match JUFF_DEVICE_TOKEN in host/.env and contain at least
+            16 characters. Example and placeholder values are rejected.
+
+    config JUFF_BUTTON_GPIO
+        int "Interrupt button GPIO (-1 disables)"
+        range -1 48
+        default 0
+
+    config JUFF_AUDIO_ENABLED
+        bool "Enable onboard Waveshare ESP32-S3-Touch-LCD-3.5 audio"
+        default y
+        help
+            Uses the microphone, codec and power amplifier built into the
+            ESP32-S3-Touch-LCD-3.5 board.
+
+    if JUFF_AUDIO_ENABLED
+
+        config JUFF_CODEC_I2C_PORT
+            int "ES8311 I2C controller"
+            range 0 1
+            default 0
+
+        config JUFF_CODEC_I2C_SCL_GPIO
+            int "ES8311 I2C SCL GPIO"
+            range 0 48
+            default 7
+
+        config JUFF_CODEC_I2C_SDA_GPIO
+            int "ES8311 I2C SDA GPIO"
+            range 0 48
+            default 8
+
+        config JUFF_CODEC_I2S_PORT
+            int "ES8311 I2S controller"
+            range 0 1
+            default 0
+
+        config JUFF_CODEC_I2S_BCLK_GPIO
+            int "ES8311 I2S BCLK GPIO"
+            range 0 48
+            default 13
+
+        config JUFF_CODEC_I2S_MCLK_GPIO
+            int "ES8311 I2S MCLK GPIO"
+            range 0 48
+            default 12
+
+        config JUFF_CODEC_I2S_WS_GPIO
+            int "ES8311 I2S WS/LRCLK GPIO"
+            range 0 48
+            default 15
+
+        config JUFF_CODEC_I2S_DOUT_GPIO
+            int "ESP32 to ES8311 data GPIO"
+            range 0 48
+            default 16
+
+        config JUFF_CODEC_I2S_DIN_GPIO
+            int "ES8311 to ESP32 data GPIO"
+            range 0 48
+            default 14
+
+        config JUFF_CODEC_PA_GPIO
+            int "Direct speaker amplifier GPIO (-1 for TCA9554)"
+            range -1 48
+            default -1
+
+        config JUFF_CODEC_PA_EXPANDER_ADDRESS
+            int "TCA9554 I2C address"
+            range 0 127
+            default 32
+
+        config JUFF_CODEC_PA_EXPANDER_PIN
+            int "TCA9554 amplifier pin"
+            range 0 7
+            default 7
+
+        config JUFF_CODEC_VOLUME
+            int "Speaker volume"
+            range 0 100
+            default 70
+
+        config JUFF_CODEC_MIC_GAIN_DB
+            int "Microphone gain (dB)"
+            range 0 42
+            default 30
+
+    endif
+
+endmenu
