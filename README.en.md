@@ -31,7 +31,7 @@ is recommended.
 
 ```bash
 xcode-select --install
-git clone <repository-url> juff
+git clone https://github.com/daniel-weih/esp32-juff.git juff
 cd juff
 ./scripts/bootstrap_macos.sh
 ```

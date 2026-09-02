@@ -55,10 +55,8 @@ xcode-select --install
 
 ### 1. 克隆并初始化
 
-仓库发布后，将 `<repository-url>` 替换成实际地址：
-
 ```bash
-git clone <repository-url> juff
+git clone https://github.com/daniel-weih/esp32-juff.git juff
 cd juff
 ./scripts/bootstrap_macos.sh
 ```
