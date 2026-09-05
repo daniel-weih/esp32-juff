@@ -6,7 +6,7 @@
 
 *基于目标开发板外观与 JUFF 固件界面生成的效果图。*
 
-JUFF 把 Waveshare **ESP32-S3-Touch-LCD-3.5** 变成一个带屏幕、触摸、
+JUFF 把 Waveshare **ESP32-S3-Touch-LCD-3.5 / 1.54** 变成一个带屏幕、触摸、
 麦克风和扬声器的实时语音终端。默认链路是加密 Bluetooth LE：
 ESP32 将麦克风音频送到 Mac，Mac 上的
 `qwen-audio-agent` 连接 DashScope，再把流式语音回答送回设备播放。
@@ -14,7 +14,7 @@ ESP32 将麦克风音频送到 Mac，Mac 上的
 Wi-Fi/WebSocket 是可选的备用链路。DashScope API Key 始终留在 Mac，
 不会写入 ESP32。
 
-> 项目目前处于硬件原型阶段，目标板型和引脚固定。它不是阿里云、
+> 项目目前处于硬件原型阶段，请按实际板型选择固件配置。它不是阿里云、
 > Qwen 或 Waveshare 的官方项目。
 
 ## 工作方式
@@ -29,15 +29,28 @@ ESP32 麦克风
     └──────── ESP32 扬声器 ◄───────────┘
 ```
 
-默认是半双工语音：JUFF 播放回答时暂停上传麦克风，屏幕或 GPIO 0 按钮
-仍可立即打断。完整设计见 [docs/architecture.md](docs/architecture.md)。
+仓库默认配置下，两款硬件均关闭本地 AEC/VAD 语音打断，采用半双工：播放
+回答时暂停上传麦克风，使用屏幕或 GPIO 0 按钮手动停止。两款硬件均可按
+[固件说明](firmware/README.md) 显式开启实验性语音打断；声学验证尚不完整。
+固件包 `manifest.json` 中的 `features.voice_interrupt` 和 `aec_reference`
+记录实际开关与该硬件的参考通路。
+
+[语音打断验证记录](docs/voice-interruption-validation.md) 保留了 `0.6.0-dev`
+的失败结果及一次校准声源冒烟测试通过结果，尚不构成声学验收。
+`0.6.2-dev` 新增大屏 ES8311 内部数字参考适配；当前开发版本为 `0.6.3-dev`，
+已清理临时显示诊断代码。大屏黑屏问题尚未得到实物恢复确认，先前声学结果
+不代表显示验收，见 [大屏 AEC 记录](docs/waveshare-lcd-3.5-aec-feasibility.md)。
+完整设计见 [docs/architecture.md](docs/architecture.md)。
 
 ## 支持的硬件
 
-- Waveshare ESP32-S3-Touch-LCD-3.5
-- ESP32-S3、16 MB Flash、8 MB Octal PSRAM
-- ST7796 320×480 LCD、FT6336 触摸
-- ES8311 Codec、板载麦克风与 NS4150B 功放
+| 板型 | 显示与触摸 | 音频 |
+| --- | --- | --- |
+| ESP32-S3-Touch-LCD-3.5 | ST7796，320×480，FT6336 | ES8311 输入／输出，TCA9554 控制功放 |
+| ESP32-S3-Touch-LCD-1.54 | ST7789，240×240，CST816 | ES7210 麦克风输入，ES8311 输出，GPIO 7 控制功放 |
+
+两款均使用 ESP32-S3、16 MB Flash、8 MB Octal PSRAM。1.54 英寸版提供紧凑
+首页和配对页，保留语音、打断、亮度控制与蓝牙配对功能。
 
 外观相似的 Touch-AMOLED-1.8 使用不同的屏幕和引脚，不能直接刷入本固件。
 
@@ -105,9 +118,30 @@ ESP-IDF 只在构建或烧录固件时需要，不是日常语音使用的依赖
 
 ```bash
 make firmware-setup
-make firmware-build
-./scripts/idf.sh -p /dev/cu.usbmodemXXXX flash monitor
+make firmware-build-35     # 3.5 英寸版：构建并打包
+make firmware-build-154    # 1.54 英寸版：构建并打包
+# 或一次生成两个版本
+make firmware-build-all
 ```
+
+两种硬件分别维护配置，公共语音功能共用代码。固件包按硬件和软件版本命名：
+
+| 硬件版本 | 板型 ID | 固件包（位于 `dist/firmware/<软件版本>/`） |
+| --- | --- | --- |
+| 3.5 英寸 | `waveshare-lcd-3.5` | `juff-waveshare-lcd-3.5-v<软件版本>.zip` |
+| 1.54 英寸 | `waveshare-lcd-1.54` | `juff-waveshare-lcd-1.54-v<软件版本>.zip` |
+
+烧录时必须明确指定板型和串口，例如烧录 1.54 英寸板：
+
+```bash
+make firmware-flash JUFF_BOARD=waveshare-lcd-1.54 PORT=/dev/cu.usbmodemXXXX
+```
+
+3.5 英寸板使用 `JUFF_BOARD=waveshare-lcd-3.5`。构建目录分别为
+`firmware/build/<板型>/`，不复用另一板型的 GPIO 或本地 `firmware/sdkconfig`。
+通用命令 `make firmware-build` 也必须指定 `JUFF_BOARD`；未指定时停止执行。
+USB 的通用 ESP32 标识无法区分这两块板，因此烧录入口不自动选择板型或串口。
+每个固件包包含烧录说明、板型清单和 SHA-256 校验值；CI 也分别构建并保存两版。
 
 请将 `/dev/cu.usbmodemXXXX` 换成当前 Mac 上实际出现的串口。首次刷机前
 建议自行备份原厂 Flash；备份可能包含设备数据且可能受厂商许可限制，
@@ -136,14 +170,20 @@ python3 -m venv .venv
 
 ## 常用命令
 
+多台 JUFF 在附近时，可指定要使用的设备，例如
+`JUFF_BLE_DEVICE=JUFF-XXXX make start`。将 `JUFF-XXXX` 替换为板载蓝牙连接页
+显示的设备名称。
+
 | 命令 | 用途 |
 | --- | --- |
 | `make setup` | 初始化一台新 Mac |
 | `make doctor` | 检查 Node、Swift、配置和设备 |
 | `make start` | 启动 Gateway、WebUI、BLE companion 和备用 Bridge |
-| `make test` | 仓库检查、Node 测试和 JuffBLE 自检 |
-| `make firmware-build` | 构建 ESP32 固件 |
-| `make firmware-flash` | 烧录并打开串口监视器 |
+| `make test` | 仓库检查、固件工具与 Node 测试、JuffBLE 自检 |
+| `make firmware-build-35` / `make firmware-build-154` | 构建并打包对应硬件版本 |
+| `make firmware-build-all` | 构建并打包两个硬件版本 |
+| `make firmware-build JUFF_BOARD=<板型>` | 仅构建指定硬件版本 |
+| `make firmware-flash JUFF_BOARD=<板型> PORT=<串口>` | 烧录指定设备并打开串口监视器 |
 
 ## 仓库结构
 

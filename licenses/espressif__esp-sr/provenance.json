@@ -1,0 +1,12 @@
+{
+  "upstream_url": "https://webrtc.googlesource.com/src/+/refs/heads/main/LICENSE",
+  "upstream_license_blob": "4c41b7b251e2f7606c70fad48eb92c8a2bc8e357",
+  "scope": "Supplementary upstream WebRTC license for the WebRTC VAD objects in ESP-SR 2.5.3 libesp_audio_processor.a. The exact WebRTC source revision used by this binary is not published in the component; this does not claim a revision match. The component ESPRESSIF MIT license and Apache-2.0 header notices are retained separately.",
+  "component_hash": "c3dd4d3a3ce520c90e6a48370f41ff1e138cea128929270ea03ee74e6710cea3",
+  "files": [
+    "WEBRTC-LICENSE"
+  ],
+  "sha256": {
+    "WEBRTC-LICENSE": "ab00a482b6a3902e40211b43c5d0441962ea99b6cc7c25c0f243fa270b78d482"
+  }
+}

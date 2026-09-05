@@ -256,7 +256,8 @@ function startBleCompanion() {
     process.stdout.write('Bluetooth companion not built; run npm run ble:build\n')
     return
   }
-  bleCompanion = spawn(bleExecutable, [], {
+  const arguments_ = config.bleDevice ? ['--device', config.bleDevice] : []
+  bleCompanion = spawn(bleExecutable, arguments_, {
     cwd: hostDirectory,
     stdio: ['pipe', 'pipe', 'pipe'],
   })

@@ -2,14 +2,17 @@ idf_component_register(
     SRCS
         "app_main.c"
         "audio_io.c"
+        "voice_frontend.c"
         "ble_manager.c"
         "board_display.c"
+        "companion_face.c"
         "device_client.c"
         "usb_provisioning.c"
         "wifi_manager.c"
     INCLUDE_DIRS "."
     REQUIRES
         bt
+        esp_app_format
         esp_event
         esp_netif
         esp_wifi

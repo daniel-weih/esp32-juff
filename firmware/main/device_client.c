@@ -6,9 +6,11 @@
 #include <string.h>
 
 #include "audio_io.h"
+#include "board_config.h"
 #include "board_display.h"
 #include "cJSON.h"
 #include "esp_log.h"
+#include "esp_app_desc.h"
 #include "esp_mac.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
@@ -151,7 +153,9 @@ static void send_hello(void)
         cJSON_AddStringToObject(message, "type", "hello");
         cJSON_AddStringToObject(message, "token", s_device_token);
         cJSON_AddStringToObject(message, "deviceId", device_id);
-        cJSON_AddStringToObject(message, "firmware", "juff-voice-terminal/0.2.0");
+        cJSON_AddStringToObject(message, "firmware", esp_app_get_description()->version);
+        cJSON_AddStringToObject(message, "board", JUFF_BOARD_ID);
+        cJSON_AddBoolToObject(message, "voiceInterrupt", audio_io_supports_voice_barge_in());
         cJSON_AddBoolToObject(message, "audioInputEnabled", audio_io_is_available());
         cJSON_AddBoolToObject(message, "audioOutputEnabled", audio_io_is_available());
         cJSON_AddNumberToObject(message, "inputSampleRate", 16000);
@@ -354,9 +358,14 @@ esp_err_t device_client_save_config(const char *bridge_uri,
     return error;
 }
 
+bool device_client_is_voice_active(void)
+{
+    return s_transport_connected && s_voice_ready;
+}
+
 bool device_client_is_ready(void)
 {
-    return s_transport_connected && s_voice_ready && !s_input_suspended;
+    return device_client_is_voice_active() && !s_input_suspended;
 }
 
 bool device_client_is_connected(void)
@@ -383,6 +392,20 @@ void device_client_send_interrupt(void)
 {
     audio_io_clear("local interrupt");
     send_simple_event("interrupt");
+}
+
+bool device_client_try_voice_interrupt(void)
+{
+    if (!device_client_is_voice_active() || s_input_suspended) {
+        return false;
+    }
+    device_client_send_interrupt();
+    return true;
+}
+
+bool device_client_allows_voice_interrupt(void)
+{
+    return device_client_is_voice_active() && !s_input_suspended;
 }
 
 void device_client_send_playback_event(const char *event_type,

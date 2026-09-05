@@ -3,9 +3,11 @@
 #include "audio_io.h"
 #include "ble_manager.h"
 #include "board_display.h"
+#include "board_config.h"
 #include "device_client.h"
 #include "driver/gpio.h"
 #include "esp_chip_info.h"
+#include "esp_app_desc.h"
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -21,7 +23,7 @@ static const char *TAG = "juff";
 static void microphone_pcm(const uint8_t *data, size_t size, void *context)
 {
     (void)context;
-    if (ble_manager_is_voice_ready()) {
+    if (ble_manager_is_voice_active()) {
         ble_manager_send_pcm(data, size);
     } else {
         device_client_send_pcm(data, size);
@@ -42,11 +44,32 @@ static void playback_event(const char *event_type,
 
 static void send_interrupt(void)
 {
-    if (ble_manager_is_voice_ready()) {
+    if (ble_manager_is_voice_active()) {
         ble_manager_send_interrupt();
     } else {
         device_client_send_interrupt();
     }
+}
+
+static bool voice_interrupt_allowed(void *context)
+{
+    (void)context;
+    return ble_manager_is_voice_active()
+        ? ble_manager_allows_voice_interrupt()
+        : device_client_allows_voice_interrupt();
+}
+
+static bool voice_interrupt(void *context)
+{
+    (void)context;
+    const bool accepted = ble_manager_is_voice_active()
+        ? ble_manager_try_voice_interrupt()
+        : device_client_try_voice_interrupt();
+    if (accepted) {
+        board_display_set_voice_state("listening");
+        board_display_set_notice("I'm listening", "Go ahead", 1000);
+    }
+    return accepted;
 }
 
 static void interrupt_button_task(void *argument)
@@ -107,7 +130,17 @@ static void log_hardware(void)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "JUFF voice companion 0.5.0 starting");
+#if CONFIG_JUFF_BOARD_WAVESHARE_LCD_154
+    // Latch the 1.54-inch board's power rail when running from its battery.
+    ESP_ERROR_CHECK(gpio_set_level(GPIO_NUM_2, 1));
+    const gpio_config_t power_config = {
+        .pin_bit_mask = 1ULL << GPIO_NUM_2,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    ESP_ERROR_CHECK(gpio_config(&power_config));
+#endif
+    ESP_LOGI(TAG, "JUFF voice companion %s starting", esp_app_get_description()->version);
+    ESP_LOGI(TAG, "Board: %s (%s)", JUFF_BOARD_NAME, JUFF_BOARD_ID);
     log_hardware();
 
     esp_err_t error = nvs_flash_init();
@@ -117,7 +150,8 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(error);
 
-    error = audio_io_init(microphone_pcm, playback_event, NULL);
+    error = audio_io_init(microphone_pcm, playback_event,
+                          voice_interrupt, voice_interrupt_allowed, NULL);
     if (error != ESP_OK) {
         ESP_LOGE(TAG,
                  "Audio hardware unavailable: %s; continuing with networking diagnostics",
@@ -131,6 +165,7 @@ void app_main(void)
                  esp_err_to_name(display_error));
     }
 
+#if CONFIG_JUFF_AUDIO_STARTUP_SELF_TEST
     if (error == ESP_OK && !wifi_manager_has_credentials()) {
         board_display_set_notice("A quick sound check",
                                  "You'll hear two soft tones",
@@ -147,6 +182,7 @@ void app_main(void)
                                      2200);
         }
     }
+#endif
     initialize_button();
 
     error = usb_provisioning_start();

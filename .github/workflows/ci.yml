@@ -22,6 +22,7 @@ jobs:
         with:
           persist-credentials: false
       - run: ./scripts/check_repository.sh
+      - run: make firmware-tools-test
 
   host:
     name: Node host tests
@@ -55,9 +56,13 @@ jobs:
       - run: ./macos/build/JuffBLE.app/Contents/MacOS/JuffBLE --self-test
 
   firmware:
-    name: ESP32-S3 firmware
+    name: Firmware (${{ matrix.board }}, AEC ${{ matrix.aec }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      matrix:
+        board: [waveshare-lcd-3.5, waveshare-lcd-1.54]
+        aec: ["n", "y"]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -67,3 +72,13 @@ jobs:
           esp_idf_version: v5.5.5
           target: esp32s3
           path: firmware
+          command: |
+            printf '\nCONFIG_JUFF_VOICE_BARGE_IN=${{ matrix.aec }}\n' >> boards/${{ matrix.board }}/sdkconfig.defaults
+            make -C .. firmware-package JUFF_BOARD=${{ matrix.board }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: firmware-${{ matrix.board }}-aec-${{ matrix.aec }}
+          path: dist/firmware/*/juff-${{ matrix.board }}-v*.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 14

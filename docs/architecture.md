@@ -8,8 +8,8 @@ on the Mac.
 
 ```text
 ┌──────────────────── ESP32-S3 ────────────────────┐
-│ LCD/touch  microphone  ES8311  speaker  GPIO 0   │
-│          firmware 0.5.x: UI + audio + BLE        │
+│ LCD/touch  microphone  codec  speaker  GPIO 0    │
+│              UI + audio + BLE                   │
 └───────────────────────┬───────────────────────────┘
                         │ encrypted BLE
                         │ control + G.711 μ-law
@@ -31,7 +31,7 @@ children down when it receives SIGINT or SIGTERM.
 
 ## BLE transport
 
-The ESP32 is a NimBLE peripheral named `JUFF-xxxx`; the suffix comes from its
+The ESP32 is a NimBLE peripheral named `JUFF-XXXX`; the suffix comes from its
 Bluetooth address. The Mac is the CoreBluetooth central.
 
 - Bluetooth LE Secure Connections, MITM pairing, and persistent bonding
@@ -70,8 +70,65 @@ consume it. The device has roughly eight seconds of downstream buffering.
 
 Each response has `audio.begin`, streamed audio, and `audio.done` lifecycle
 events. `playback.clear` immediately discards queued data and turns off the
-amplifier. Current operation is half-duplex to prevent acoustic feedback;
-natural full-duplex barge-in would require acoustic echo cancellation.
+amplifier. Both transports pause microphone upload during playback. Normal
+builds for both hardware profiles use half-duplex audio and manual interruption.
+Touch and BOOT/GPIO 0 stop controls route interruption to the active transport.
+
+### Experimental voice interruption
+
+Repository defaults disable `CONFIG_JUFF_VOICE_BARGE_IN` for both boards. The
+two profiles support explicit opt-in through `menuconfig`; package
+manifests record the actual setting in `features.voice_interrupt` and the
+reference type in `features.aec_reference`. See the
+[firmware guide](../firmware/README.md) for build instructions.
+
+On the 1.54-inch board, the frontend treats ES7210 TDM slot 0 as the microphone and
+slot 1 as the reference, corresponding to physical MIC3. The DAC output is
+sampled before the power amplifier through a resistor network with about
+24 dB attenuation. `CONFIG_JUFF_CODEC_REFERENCE_GAIN_DB` sets MIC3 gain
+independently: 24 dB by default, or 21 dB above compile-time speaker volume 85.
+The reference stays on the device. Electrical tests confirmed the reference
+path but also found waveform distortion at maximum volume. The absence of
+ADC clipping does not establish a clean signal.
+
+On the 3.5-inch board, ES8311 digital feedback returns the microphone in the
+left receive slot and the right transmit slot's PCM in the right receive slot.
+The single input/output codec opens both directions as two-channel PCM16 at
+24 kHz. Playback duplicates each mono sample into both slots, including
+diagnostic tones. Reference samples are before DAC volume/mute and do not
+measure analog distortion. No ES7210 channel gain is applied to this board.
+See the [large-board record](waveshare-lcd-3.5-aec-feasibility.md).
+
+Each 20 ms block of 24 kHz interleaved input is resampled to 16 kHz using the
+same sample positions for both channels. ESP-SR 2.5.3 runs
+`AEC_MODE_FD_HIGH_PERF`, followed by WebRTC VAD. The small board retains
+`AEC_NLP_LEVEL_NORMAL`; the large board uses `AEC_NLP_LEVEL_VERYAGGR` for residual
+echo from its digital reference path. Its AEC profile defaults to 24 dB
+microphone digital scaling to reduce full-scale PCM output during playback.
+This driver setting does not change the ES8311 analog PGA. Saved configurations
+retain their previous values.
+Detection waits for actual PCM playback and active reference energy, then
+400 ms of warmup. It requires 120 ms of continuous speech above
+`max(180 RMS, 3 × estimated noise RMS)`.
+
+On detection, the device stops playback and sends `interrupt` before resuming
+microphone upload, including 300 ms of speech history and frames captured
+before upload resumes. BLE transmission remains half-duplex; the cloud gets
+no microphone stream during playback. `input.suspend` disables detection and
+clears buffered speech.
+
+Both profiles use a 64 KB data cache with 64-byte lines and external
+NimBLE allocations. The frontend's 4800-sample history and 8000-sample pending
+buffer occupy 25,600 bytes in PSRAM. DMA buffers, AEC work frames and task
+stacks remain internal. Failed frontend initialization releases partial
+allocations and falls back to ordinary half-duplex audio.
+
+Historical `0.6.0-dev` tests found self-interruptions and missed near-end speech;
+one later calibrated acoustic smoke test passed. Broader acceptance remains
+incomplete. The [validation record](voice-interruption-validation.md) separates
+software checks, electrical measurements, offline DSP results and acoustic
+limits. Startup audio diagnostics are disabled by default; `audio_test` is an
+explicit command.
 
 ## Optional Wi-Fi transport
 

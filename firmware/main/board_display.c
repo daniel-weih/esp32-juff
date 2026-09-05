@@ -1,4 +1,6 @@
 #include "board_display.h"
+#include "board_config.h"
+#include "companion_face.h"
 
 #include <inttypes.h>
 #include <limits.h>
@@ -9,12 +11,15 @@
 #include "audio_io.h"
 #include "ble_manager.h"
 #include "device_client.h"
+#include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
 #include "esp_check.h"
 #include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_vendor.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -23,32 +28,19 @@
 #include "lvgl.h"
 #include "wifi_manager.h"
 
-#define LCD_HOST SPI2_HOST
-#define LCD_WIDTH 320
-#define LCD_HEIGHT 480
-#define LCD_DRAW_ROWS 24
-#define LCD_PIXEL_CLOCK_HZ (80 * 1000 * 1000)
-#define LCD_PIN_MOSI 1
-#define LCD_PIN_CLOCK 5
-#define LCD_PIN_DC 3
-#define LCD_PIN_BACKLIGHT 6
-#define LCD_RESET_EXPANDER_PIN 1
-#define TOUCH_ADDRESS 0x38
 #define LVGL_TICK_MS 2
 
-#define COLOR_BACKGROUND 0x060914
-#define COLOR_BACKGROUND_END 0x101B2F
-#define COLOR_SURFACE 0x111A2D
-#define COLOR_SURFACE_RAISED 0x192641
-#define COLOR_PRIMARY 0x62E7D0
-#define COLOR_PRIMARY_DEEP 0x18BFA7
-#define COLOR_BLUE 0x55B8FF
-#define COLOR_VIOLET 0x8D7CFF
-#define COLOR_WARNING 0xFFBE69
-#define COLOR_DANGER 0xFF6F87
-#define COLOR_TEXT 0xF7FAFF
-#define COLOR_MUTED 0x91A1B8
-#define COLOR_OFF 0x45546C
+#define COLOR_BACKGROUND 0xF3EEDC
+#define COLOR_SURFACE 0xE7E5D5
+#define COLOR_SURFACE_RAISED 0xD7DBC8
+#define COLOR_PRIMARY 0xD3E2BA
+#define COLOR_PRIMARY_DEEP 0x63875E
+#define COLOR_BLUE 0x547A70
+#define COLOR_WARNING 0xB85C45
+#define COLOR_DANGER 0xEDC4AF
+#define COLOR_TEXT 0x203B32
+#define COLOR_MUTED 0x67766C
+#define COLOR_OFF 0xC7CEBB
 
 typedef struct {
     uint8_t command;
@@ -86,20 +78,10 @@ static uint64_t s_notice_until_ms;
 
 static lv_obj_t *s_connection_pill;
 static lv_obj_t *s_connection_label;
-static lv_obj_t *s_orb_halo;
-static lv_obj_t *s_voice_arc;
-static lv_obj_t *s_orb;
-static lv_obj_t *s_orb_icon;
-static lv_obj_t *s_orb_live_dot;
+static lv_obj_t *s_face;
+static lv_obj_t *s_status_dot;
 static lv_obj_t *s_main_title;
 static lv_obj_t *s_main_detail;
-static lv_obj_t *s_wave_bars[7];
-static lv_obj_t *s_qwen_chip;
-static lv_obj_t *s_qwen_dot;
-static lv_obj_t *s_qwen_label;
-static lv_obj_t *s_mic_chip;
-static lv_obj_t *s_mic_dot;
-static lv_obj_t *s_mic_label;
 static lv_obj_t *s_primary_button;
 static lv_obj_t *s_primary_button_label;
 static lv_obj_t *s_brightness_label;
@@ -110,6 +92,7 @@ static lv_obj_t *s_connection_detail_label;
 static lv_obj_t *s_pairing_button;
 static lv_obj_t *s_pairing_button_label;
 
+#if !CONFIG_JUFF_BOARD_WAVESHARE_LCD_154
 static const uint8_t s_cmd_colmod[] = { 0x05 };
 static const uint8_t s_cmd_unlock_one[] = { 0xC3 };
 static const uint8_t s_cmd_unlock_two[] = { 0x96 };
@@ -157,6 +140,7 @@ static const lcd_init_command_t s_lcd_init_commands[] = {
     { 0x21, NULL, 0, 0 },
     { 0x29, NULL, 0, 20 },
 };
+#endif
 
 static uint64_t uptime_ms(void)
 {
@@ -226,54 +210,9 @@ static bool lcd_transfer_done(esp_lcd_panel_io_handle_t panel_io,
     return false;
 }
 
-static esp_err_t initialize_lcd(void)
+#if CONFIG_JUFF_BOARD_WAVESHARE_LCD_35
+static esp_err_t initialize_st7796(void)
 {
-    ESP_LOGI(TAG,
-             "Initializing ST7796 LCD: 320x480, MOSI=%d CLK=%d DC=%d BL=%d",
-             LCD_PIN_MOSI,
-             LCD_PIN_CLOCK,
-             LCD_PIN_DC,
-             LCD_PIN_BACKLIGHT);
-
-    ESP_RETURN_ON_ERROR(audio_io_set_expander_pin(LCD_RESET_EXPANDER_PIN, false),
-                        TAG,
-                        "assert LCD reset on TCA9554 EXIO1");
-    vTaskDelay(pdMS_TO_TICKS(100));
-    ESP_RETURN_ON_ERROR(audio_io_set_expander_pin(LCD_RESET_EXPANDER_PIN, true),
-                        TAG,
-                        "release LCD reset on TCA9554 EXIO1");
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    const spi_bus_config_t bus = {
-        .mosi_io_num = LCD_PIN_MOSI,
-        .miso_io_num = GPIO_NUM_NC,
-        .sclk_io_num = LCD_PIN_CLOCK,
-        .quadwp_io_num = GPIO_NUM_NC,
-        .quadhd_io_num = GPIO_NUM_NC,
-        .max_transfer_sz = LCD_WIDTH * LCD_DRAW_ROWS * sizeof(lv_color_t),
-    };
-    ESP_RETURN_ON_ERROR(spi_bus_initialize(LCD_HOST, &bus, SPI_DMA_CH_AUTO),
-                        TAG,
-                        "initialize LCD SPI bus");
-
-    const esp_lcd_panel_io_spi_config_t io = {
-        .cs_gpio_num = GPIO_NUM_NC,
-        .dc_gpio_num = LCD_PIN_DC,
-        .spi_mode = 0,
-        .pclk_hz = LCD_PIXEL_CLOCK_HZ,
-        .trans_queue_depth = 10,
-        .on_color_trans_done = lcd_transfer_done,
-        .user_ctx = &s_display_driver,
-        .lcd_cmd_bits = 8,
-        .lcd_param_bits = 8,
-    };
-    ESP_RETURN_ON_ERROR(
-        esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST,
-                                 &io,
-                                 &s_lcd_io),
-        TAG,
-        "attach ST7796 panel IO");
-
     ESP_RETURN_ON_ERROR(lcd_command(0x01, NULL, 0), TAG, "software reset LCD");
     vTaskDelay(pdMS_TO_TICKS(20));
 
@@ -314,6 +253,79 @@ static esp_err_t initialize_lcd(void)
     ESP_LOGI(TAG, "ST7796 initialization complete");
     return ESP_OK;
 }
+#endif
+
+static esp_err_t initialize_lcd(void)
+{
+    ESP_LOGI(TAG,
+             "Initializing LCD: %dx%d, MOSI=%d CLK=%d DC=%d BL=%d",
+             LCD_WIDTH,
+             LCD_HEIGHT,
+             LCD_PIN_MOSI,
+             LCD_PIN_CLOCK,
+             LCD_PIN_DC,
+             LCD_PIN_BACKLIGHT);
+
+#if !CONFIG_JUFF_BOARD_WAVESHARE_LCD_154
+    ESP_RETURN_ON_ERROR(audio_io_set_expander_pin(LCD_RESET_EXPANDER_PIN, false),
+                        TAG,
+                        "assert LCD reset on TCA9554 EXIO1");
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_RETURN_ON_ERROR(audio_io_set_expander_pin(LCD_RESET_EXPANDER_PIN, true),
+                        TAG,
+                        "release LCD reset on TCA9554 EXIO1");
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+#endif
+    const spi_bus_config_t bus = {
+        .mosi_io_num = LCD_PIN_MOSI,
+        .miso_io_num = GPIO_NUM_NC,
+        .sclk_io_num = LCD_PIN_CLOCK,
+        .quadwp_io_num = GPIO_NUM_NC,
+        .quadhd_io_num = GPIO_NUM_NC,
+        .max_transfer_sz = LCD_WIDTH * LCD_DRAW_ROWS * sizeof(lv_color_t),
+    };
+    ESP_RETURN_ON_ERROR(spi_bus_initialize(LCD_HOST, &bus, SPI_DMA_CH_AUTO),
+                        TAG,
+                        "initialize LCD SPI bus");
+
+    const esp_lcd_panel_io_spi_config_t io = {
+        .cs_gpio_num = LCD_PIN_CS,
+        .dc_gpio_num = LCD_PIN_DC,
+        .spi_mode = LCD_SPI_MODE,
+        .pclk_hz = LCD_PIXEL_CLOCK_HZ,
+        .trans_queue_depth = 10,
+        .on_color_trans_done = lcd_transfer_done,
+        .user_ctx = &s_display_driver,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+    };
+    ESP_RETURN_ON_ERROR(
+        esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST,
+                                 &io,
+                                 &s_lcd_io),
+        TAG,
+        "attach LCD panel IO");
+
+#if CONFIG_JUFF_BOARD_WAVESHARE_LCD_154
+    esp_lcd_panel_handle_t panel = NULL;
+    const esp_lcd_panel_dev_config_t panel_config = {
+        .reset_gpio_num = LCD_PIN_RESET,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .bits_per_pixel = 16,
+    };
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(s_lcd_io, &panel_config, &panel),
+                        TAG, "create ST7789 panel");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(panel), TAG, "reset ST7789");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(panel), TAG, "initialize ST7789");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(panel, true), TAG, "invert ST7789");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(panel, true), TAG, "enable ST7789");
+    ESP_LOGI(TAG, "ST7789 initialization complete");
+#else
+    ESP_RETURN_ON_ERROR(initialize_st7796(), TAG, "initialize ST7796");
+#endif
+    return ESP_OK;
+}
 
 static esp_err_t lcd_fill_solid(uint16_t rgb565)
 {
@@ -329,7 +341,9 @@ static esp_err_t lcd_fill_solid(uint16_t rgb565)
         stripe[index] = wire_color;
     }
 
-    const uint8_t column[] = { 0x00, 0x00, 0x01, 0x3F };
+    const uint8_t column[] = {
+        0, 0, (uint8_t)((LCD_WIDTH - 1) >> 8), (uint8_t)(LCD_WIDTH - 1),
+    };
     esp_err_t error = ESP_OK;
     for (uint16_t y = 0; y < LCD_HEIGHT && error == ESP_OK; y += LCD_DRAW_ROWS) {
         const uint16_t y_end = (uint16_t)(
@@ -446,26 +460,45 @@ static esp_err_t initialize_touch(lv_disp_t *display)
     if (bus == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
+#if CONFIG_JUFF_BOARD_WAVESHARE_LCD_154
+    const gpio_config_t reset_config = {
+        .pin_bit_mask = 1ULL << TOUCH_PIN_RESET,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&reset_config), TAG, "configure touch reset");
+    ESP_RETURN_ON_ERROR(gpio_set_level(TOUCH_PIN_RESET, 0), TAG, "assert touch reset");
+    vTaskDelay(pdMS_TO_TICKS(10));
+    ESP_RETURN_ON_ERROR(gpio_set_level(TOUCH_PIN_RESET, 1), TAG, "release touch reset");
+    vTaskDelay(pdMS_TO_TICKS(100));
+#endif
     ESP_RETURN_ON_ERROR(i2c_master_probe(bus, TOUCH_ADDRESS, 100),
                         TAG,
-                        "probe FT6336 touch at 0x38");
+                        "probe " TOUCH_NAME " touch");
     const i2c_device_config_t device = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = TOUCH_ADDRESS,
-        .scl_speed_hz = 400000,
+        .scl_speed_hz = TOUCH_I2C_SPEED_HZ,
     };
     ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(bus, &device, &s_touch),
                         TAG,
-                        "attach FT6336 touch");
+                        "attach " TOUCH_NAME " touch");
+#if CONFIG_JUFF_BOARD_WAVESHARE_LCD_154
+    // Keep CST816 awake so LVGL polling can read press and release events.
+    const uint8_t disable_auto_sleep[] = { 0xFE, 0x01 };
+    ESP_RETURN_ON_ERROR(i2c_master_transmit(s_touch, disable_auto_sleep,
+                                           sizeof(disable_auto_sleep), 100),
+                        TAG, "disable CST816 auto sleep");
+#endif
     uint8_t chip_id = 0;
-    ESP_ERROR_CHECK_WITHOUT_ABORT(touch_read(0xA3, &chip_id, 1));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(touch_read(TOUCH_CHIP_ID_REGISTER, &chip_id, 1));
 
     lv_indev_drv_init(&s_touch_driver);
     s_touch_driver.type = LV_INDEV_TYPE_POINTER;
     s_touch_driver.disp = display;
     s_touch_driver.read_cb = touch_read_callback;
     lv_indev_drv_register(&s_touch_driver);
-    ESP_LOGI(TAG, "FT6336 touch ready at 0x38 (chip id=0x%02x)", chip_id);
+    ESP_LOGI(TAG, TOUCH_NAME " touch ready at 0x%02x (chip id=0x%02x)",
+             TOUCH_ADDRESS, chip_id);
     return ESP_OK;
 }
 
@@ -476,7 +509,7 @@ static void style_panel(lv_obj_t *object, uint32_t color, int radius)
     lv_obj_set_style_border_width(object, 0, 0);
     lv_obj_set_style_radius(object, radius, 0);
     lv_obj_set_style_pad_all(object, 0, 0);
-    lv_obj_clear_flag(object, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(object, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 }
 
 static lv_obj_t *make_label(lv_obj_t *parent,
@@ -493,6 +526,7 @@ static lv_obj_t *make_label(lv_obj_t *parent,
 
 static void set_button_style(lv_obj_t *button, uint32_t color)
 {
+    lv_obj_set_style_pad_all(button, 0, 0);
     lv_obj_set_style_bg_color(button, lv_color_hex(color), 0);
     lv_obj_set_style_bg_color(button,
                               lv_color_hex(COLOR_SURFACE_RAISED),
@@ -502,7 +536,7 @@ static void set_button_style(lv_obj_t *button, uint32_t color)
                               LV_STATE_DISABLED);
     lv_obj_set_style_bg_opa(button, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(button, 0, 0);
-    lv_obj_set_style_radius(button, 18, 0);
+    lv_obj_set_style_radius(button, 12, 0);
     lv_obj_set_style_shadow_width(button, 0, 0);
     lv_obj_set_style_shadow_opa(button, LV_OPA_TRANSP, 0);
     lv_obj_clear_flag(button, LV_OBJ_FLAG_SCROLLABLE);
@@ -513,19 +547,6 @@ static void set_label_text(lv_obj_t *label, const char *text)
     if (strcmp(lv_label_get_text(label), text) != 0) {
         lv_label_set_text(label, text);
     }
-}
-
-static void set_chip_state(lv_obj_t *chip,
-                           lv_obj_t *dot,
-                           lv_obj_t *label,
-                           uint32_t color,
-                           const char *text)
-{
-    lv_obj_set_style_border_color(chip, lv_color_hex(color), 0);
-    lv_obj_set_style_bg_color(dot, lv_color_hex(color), 0);
-    lv_obj_set_style_shadow_color(dot, lv_color_hex(color), 0);
-    lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
-    set_label_text(label, text);
 }
 
 static void snapshot_ui_state(char title[40],
@@ -558,286 +579,126 @@ static void snapshot_ui_state(char title[40],
 
 static void refresh_status_ui(void)
 {
-    const bool has_wifi = wifi_manager_has_credentials();
     const bool wifi_connected = wifi_manager_is_connected();
     const bool ble_connected = ble_manager_is_connected();
     const bool ble_advertising = ble_manager_is_advertising();
     const bool ble_pairing = ble_manager_is_pairing();
     const bool ble_audio_connected = ble_manager_audio_is_connected();
-    const bool ble_voice_ready = ble_manager_is_voice_ready();
+    const bool ble_voice_active = ble_manager_is_voice_active();
     const bool bridge_connected = ble_audio_connected || device_client_is_connected();
-    bool voice_ready = ble_voice_ready || device_client_is_ready();
+    const bool voice_ready = ble_voice_active || device_client_is_voice_active();
     const bool playing = audio_io_is_playing();
     const bool audio_ready = audio_io_is_available();
+    const bool voice_interrupt_allowed = audio_io_supports_voice_barge_in()
+        && (ble_voice_active ? ble_manager_allows_voice_interrupt()
+                             : device_client_allows_voice_interrupt());
+    const bool mic_ready = voice_interrupt_allowed || (!playing && (ble_voice_active
+        ? ble_manager_is_voice_ready() : device_client_is_ready()));
 
     char notice_title[40];
     char notice_detail[96];
     bool test_running = false;
     voice_visual_state_t voice_state = VOICE_VISUAL_IDLE;
-    snapshot_ui_state(notice_title,
-                      notice_detail,
-                      &test_running,
-                      &voice_state);
-    if (ble_audio_connected
-        && (playing || voice_state != VOICE_VISUAL_IDLE)) {
-        voice_ready = true;
-    }
-    if (playing) {
-        voice_state = VOICE_VISUAL_SPEAKING;
+    snapshot_ui_state(notice_title, notice_detail, &test_running, &voice_state);
+    if (playing) voice_state = VOICE_VISUAL_SPEAKING;
+    else if (!voice_ready) voice_state = VOICE_VISUAL_IDLE;
+
+    const char *title = "hey, you.";
+    const char *detail = "say something. I'm here.";
+    companion_mood_t mood = COMPANION_MOOD_READY;
+    if (!audio_ready) {
+        mood = COMPANION_MOOD_ALERT;
+        title = "a little hiccup.";
+        detail = "check audio on your Mac";
     } else if (!voice_ready) {
-        voice_state = VOICE_VISUAL_IDLE;
+        mood = bridge_connected || ble_connected ? COMPANION_MOOD_THINKING
+                                                : COMPANION_MOOD_DOZING;
+        title = bridge_connected ? "waking up..." : "let's connect.";
+        detail = bridge_connected ? "just a little moment" : "open JUFF on your Mac";
+    } else if (voice_state == VOICE_VISUAL_SPEAKING) {
+        mood = COMPANION_MOOD_SPEAKING;
+        title = "here's a thought.";
+        detail = voice_interrupt_allowed ? "speak to interrupt" : "tap my face to stop";
+    } else if (voice_state == VOICE_VISUAL_PROCESSING) {
+        mood = COMPANION_MOOD_THINKING;
+        title = "hmm...";
+        detail = "give me a little moment";
+    } else if (!mic_ready) {
+        mood = COMPANION_MOOD_MUTED;
+        title = "a quiet moment.";
+        detail = "microphone is paused";
+    } else if (voice_state == VOICE_VISUAL_LISTENING) {
+        mood = COMPANION_MOOD_LISTENING;
+        title = "all ears.";
+        detail = "go on. I'm listening.";
+    }
+    if (test_running) mood = COMPANION_MOOD_ALERT;
+    if (notice_title[0] != '\0') {
+        title = notice_title;
+        detail = notice_detail;
     }
 
-    const char *title = notice_title;
-    const char *detail = notice_detail;
-    const char *icon = LV_SYMBOL_AUDIO;
-    const char *primary_text = LV_SYMBOL_AUDIO "  JUST START TALKING";
-    uint32_t orb_color = COLOR_PRIMARY;
-    uint32_t orb_gradient = COLOR_BLUE;
-    uint32_t primary_color = COLOR_SURFACE_RAISED;
-
-    if (title[0] == '\0') {
-        if (!voice_ready) {
-            icon = LV_SYMBOL_BLUETOOTH;
-            primary_text = LV_SYMBOL_BLUETOOTH "  OPEN MAC";
-            if (ble_audio_connected || bridge_connected) {
-                title = "Waking up Qwen";
-                detail = "Your private audio link is ready. Just a moment...";
-                orb_color = COLOR_BLUE;
-                orb_gradient = COLOR_VIOLET;
-            } else if (ble_connected) {
-                title = "Mac found";
-                detail = "Opening the realtime voice connection";
-                orb_color = COLOR_BLUE;
-                orb_gradient = COLOR_PRIMARY;
-            } else if (ble_advertising || !has_wifi) {
-                title = "Meet JUFF";
-                detail = "Open the JUFF service on your Mac to begin";
-                orb_color = COLOR_BLUE;
-                orb_gradient = COLOR_VIOLET;
-            } else if (!wifi_connected) {
-                title = "Getting online";
-                detail = "Connecting with your saved network";
-                orb_color = COLOR_WARNING;
-                orb_gradient = COLOR_DANGER;
-            } else {
-                title = "Almost there";
-                detail = "Waiting for the voice service";
-                orb_color = COLOR_BLUE;
-                orb_gradient = COLOR_VIOLET;
-            }
-        } else {
-            switch (voice_state) {
-            case VOICE_VISUAL_LISTENING:
-                title = "I'm listening";
-                detail = "Go ahead - you don't need to press anything";
-                icon = LV_SYMBOL_BARS;
-                primary_text = LV_SYMBOL_AUDIO "  I'M LISTENING";
-                primary_color = COLOR_PRIMARY_DEEP;
-                orb_color = COLOR_PRIMARY;
-                orb_gradient = COLOR_BLUE;
-                break;
-            case VOICE_VISUAL_PROCESSING:
-                title = "Thinking it through";
-                detail = "Qwen is preparing a helpful answer";
-                icon = LV_SYMBOL_REFRESH;
-                primary_text = LV_SYMBOL_STOP "  CANCEL REQUEST";
-                primary_color = COLOR_VIOLET;
-                orb_color = COLOR_VIOLET;
-                orb_gradient = COLOR_BLUE;
-                break;
-            case VOICE_VISUAL_SPEAKING:
-                title = "Here's what I found";
-                detail = "Tap the orb or Stop anytime to interrupt";
-                icon = LV_SYMBOL_VOLUME_MAX;
-                primary_text = LV_SYMBOL_STOP "  STOP RESPONSE";
-                primary_color = COLOR_DANGER;
-                orb_color = COLOR_PRIMARY;
-                orb_gradient = COLOR_VIOLET;
-                break;
-            case VOICE_VISUAL_IDLE:
-            default: {
-                static const char *const hints[] = {
-                    "Just speak naturally - no button needed",
-                    "Ask a follow-up whenever you like",
-                    "Try: Help me plan the rest of my day",
-                };
-                title = "Ready when you are";
-                detail = hints[(s_animation_phase / 42U) % 3U];
-                break;
-            }
-        }
-        }
-    } else if (test_running) {
-        orb_color = COLOR_WARNING;
-        orb_gradient = COLOR_DANGER;
-        icon = LV_SYMBOL_AUDIO;
-        primary_text = LV_SYMBOL_AUDIO "  AUDIO CHECK";
-        primary_color = COLOR_WARNING;
-    }
-
+    // A notice can change the caption, but must never hide a live stop action.
+    const bool can_interrupt = voice_ready && (playing
+        || voice_state == VOICE_VISUAL_LISTENING
+        || voice_state == VOICE_VISUAL_PROCESSING
+        || voice_state == VOICE_VISUAL_SPEAKING);
+    const char *action = can_interrupt
+        ? (voice_state == VOICE_VISUAL_PROCESSING ? LV_SYMBOL_CLOSE "  cancel"
+                                                 : LV_SYMBOL_STOP "  stop")
+        : LV_SYMBOL_BLUETOOTH "  connection";
     set_label_text(s_main_title, title);
     set_label_text(s_main_detail, detail);
-    set_label_text(s_orb_icon, icon);
-    set_label_text(s_primary_button_label, primary_text);
-    lv_obj_set_style_bg_color(s_orb, lv_color_hex(orb_color), 0);
-    lv_obj_set_style_bg_grad_color(s_orb, lv_color_hex(orb_gradient), 0);
-    lv_obj_set_style_shadow_color(s_orb, lv_color_hex(orb_color), 0);
-    lv_obj_set_style_border_color(s_orb_halo, lv_color_hex(orb_color), 0);
-    lv_obj_set_style_arc_color(s_voice_arc,
-                               lv_color_hex(orb_color),
-                               LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(s_orb_live_dot,
-                              lv_color_hex(voice_ready ? COLOR_PRIMARY
-                                                       : COLOR_WARNING),
-                              0);
+    set_label_text(s_primary_button_label, action);
     lv_obj_set_style_bg_color(s_primary_button,
-                              lv_color_hex(primary_color),
-                              0);
+                              lv_color_hex(can_interrupt ? COLOR_DANGER : COLOR_PRIMARY), 0);
+    companion_face_set(s_face, mood, s_animation_phase);
 
-    const uint8_t pulse = (uint8_t)(45U
-                                    + ((s_animation_phase % 12U) < 6U
-                                           ? (s_animation_phase % 6U) * 18U
-                                           : (11U - (s_animation_phase % 12U)) * 18U));
-    lv_obj_set_style_border_opa(s_orb_halo, pulse, 0);
-    lv_arc_set_rotation(s_voice_arc,
-                        (uint16_t)((s_animation_phase *
-                                    (voice_state == VOICE_VISUAL_PROCESSING ? 17U : 7U))
-                                   % 360U));
-
-    for (unsigned index = 0; index < 7; ++index) {
-        unsigned height = 5;
-        if (!voice_ready) {
-            height += (index + s_animation_phase / 5U) % 3U;
-        } else if (voice_state == VOICE_VISUAL_LISTENING) {
-            height = 8U + ((s_animation_phase * 11U + index * 17U) % 23U);
-        } else if (voice_state == VOICE_VISUAL_PROCESSING) {
-            const unsigned wave = (s_animation_phase + index * 2U) % 12U;
-            height = 7U + (wave < 6U ? wave : 12U - wave) * 4U;
-        } else if (voice_state == VOICE_VISUAL_SPEAKING) {
-            height = 9U + ((s_animation_phase * 13U + index * 19U) % 22U);
-        } else {
-            height = 5U + ((index + s_animation_phase / 4U) % 4U) * 2U;
-        }
-        lv_obj_set_height(s_wave_bars[index], (lv_coord_t)height);
-        lv_obj_set_y(s_wave_bars[index], (lv_coord_t)(237 - height));
-        lv_obj_set_style_bg_color(s_wave_bars[index],
-                                  lv_color_hex(orb_color),
-                                  0);
-    }
-
-    if (ble_pairing) {
-        set_label_text(s_connection_label, LV_SYMBOL_BLUETOOTH "  OPEN");
-        lv_obj_set_style_border_color(s_connection_pill,
-                                      lv_color_hex(COLOR_WARNING),
-                                      0);
-        lv_obj_set_style_text_color(s_connection_label,
-                                    lv_color_hex(COLOR_WARNING),
-                                    0);
-    } else if (ble_voice_ready) {
-        set_label_text(s_connection_label, LV_SYMBOL_BLUETOOTH "  LIVE");
-        lv_obj_set_style_border_color(s_connection_pill,
-                                      lv_color_hex(COLOR_PRIMARY),
-                                      0);
-        lv_obj_set_style_text_color(s_connection_label,
-                                    lv_color_hex(COLOR_PRIMARY),
-                                    0);
-    } else if (wifi_connected) {
-        set_label_text(s_connection_label, LV_SYMBOL_WIFI "  LIVE");
-        lv_obj_set_style_border_color(s_connection_pill,
-                                      lv_color_hex(COLOR_PRIMARY),
-                                      0);
-        lv_obj_set_style_text_color(s_connection_label,
-                                    lv_color_hex(COLOR_PRIMARY),
-                                    0);
-    } else if (ble_connected) {
-        set_label_text(s_connection_label, LV_SYMBOL_BLUETOOTH "  MAC");
-        lv_obj_set_style_border_color(s_connection_pill,
-                                      lv_color_hex(COLOR_BLUE),
-                                      0);
-        lv_obj_set_style_text_color(s_connection_label,
-                                    lv_color_hex(COLOR_BLUE),
-                                    0);
-    } else if (ble_advertising) {
-        set_label_text(s_connection_label, LV_SYMBOL_BLUETOOTH "  PAIR");
-        lv_obj_set_style_border_color(s_connection_pill,
-                                      lv_color_hex(COLOR_BLUE),
-                                      0);
-        lv_obj_set_style_text_color(s_connection_label,
-                                    lv_color_hex(COLOR_BLUE),
-                                    0);
-    } else {
-        set_label_text(s_connection_label, LV_SYMBOL_USB "  USB");
-        lv_obj_set_style_border_color(s_connection_pill,
-                                      lv_color_hex(COLOR_OFF),
-                                      0);
-        lv_obj_set_style_text_color(s_connection_label,
-                                    lv_color_hex(COLOR_MUTED),
-                                    0);
-    }
-
-    set_chip_state(s_qwen_chip,
-                   s_qwen_dot,
-                   s_qwen_label,
-                   voice_ready ? COLOR_PRIMARY
-                               : (bridge_connected ? COLOR_BLUE : COLOR_OFF),
-                   voice_ready ? "QWEN READY"
-                               : (bridge_connected ? "QWEN LINK" : "QWEN OFF"));
-    set_chip_state(s_mic_chip,
-                   s_mic_dot,
-                   s_mic_label,
-                   !audio_ready ? COLOR_DANGER
-                                : (voice_ready ? COLOR_PRIMARY : COLOR_BLUE),
-                   !audio_ready ? "MIC ERROR"
-                                : (voice_state == VOICE_VISUAL_LISTENING
-                                       ? "HEARING YOU"
-                                       : (voice_ready ? "MIC LIVE" : "MIC READY")));
-    lv_label_set_text_fmt(s_brightness_label,
-                          LV_SYMBOL_EYE_OPEN "\n%u%%",
-                          s_brightness);
+    uint32_t connection_color = COLOR_MUTED;
+    const char *connection_icon = LV_SYMBOL_BLUETOOTH;
+    if (ble_pairing) connection_color = COLOR_WARNING;
+    else if (voice_ready) connection_color = COLOR_TEXT;
+    else if (wifi_connected) {
+        connection_color = COLOR_TEXT;
+        connection_icon = LV_SYMBOL_WIFI;
+    } else if (ble_connected || ble_advertising) connection_color = COLOR_BLUE;
+    set_label_text(s_connection_label, connection_icon);
+    lv_obj_set_style_text_color(s_connection_label, lv_color_hex(connection_color), 0);
+    lv_obj_set_style_bg_color(s_status_dot,
+                              lv_color_hex(!audio_ready ? COLOR_WARNING
+                                           : (voice_ready ? COLOR_PRIMARY_DEEP : COLOR_OFF)), 0);
+    lv_label_set_text_fmt(s_brightness_label, LV_SYMBOL_EYE_OPEN " %u", s_brightness);
 
     if (s_connection_device_label != NULL) {
         set_label_text(s_connection_device_label, ble_manager_device_name());
+        const bool showing_passkey = ble_pairing
+            && strcmp(notice_title, "Pair with JUFF") == 0;
+        lv_obj_set_style_text_font(s_connection_detail_label,
+                                  showing_passkey ? &lv_font_montserrat_24
+                                      : (UI_COMPACT ? &lv_font_montserrat_14
+                                                    : &lv_font_montserrat_16), 0);
+        lv_obj_set_style_text_align(s_connection_detail_label,
+                                   showing_passkey ? LV_TEXT_ALIGN_CENTER : LV_TEXT_ALIGN_LEFT, 0);
         if (ble_pairing) {
             const uint32_t seconds = ble_manager_pairing_seconds_remaining();
             char button_text[48];
-            snprintf(button_text,
-                     sizeof(button_text),
-                     LV_SYMBOL_CLOSE "  CANCEL  %u:%02u",
-                     (unsigned)(seconds / 60U),
-                     (unsigned)(seconds % 60U));
+            snprintf(button_text, sizeof(button_text), LV_SYMBOL_CLOSE "  cancel  %u:%02u",
+                     (unsigned)(seconds / 60U), (unsigned)(seconds % 60U));
             set_label_text(s_pairing_button_label, button_text);
-            set_label_text(s_connection_status_label,
-                           "DISCOVERABLE NOW");
-            if (strcmp(notice_title, "Pair with JUFF") == 0) {
-                set_label_text(s_connection_detail_label, notice_detail);
-            } else {
-                set_label_text(s_connection_detail_label,
-                               "Open JUFF on the new Mac. The pairing code will appear here.");
-            }
-            lv_obj_set_style_text_color(s_connection_status_label,
-                                        lv_color_hex(COLOR_WARNING),
-                                        0);
-            lv_obj_set_style_bg_color(s_pairing_button,
-                                      lv_color_hex(COLOR_DANGER),
-                                      0);
+            set_label_text(s_connection_status_label, "LOOKING FOR A MAC");
+            set_label_text(s_connection_detail_label, showing_passkey ? notice_detail
+                : "Open JUFF on your Mac. Your pairing code will appear here.");
+            lv_obj_set_style_text_color(s_connection_status_label, lv_color_hex(COLOR_WARNING), 0);
+            lv_obj_set_style_bg_color(s_pairing_button, lv_color_hex(COLOR_DANGER), 0);
         } else {
-            set_label_text(s_pairing_button_label,
-                           "+  PAIR A NEW MAC");
-            set_label_text(s_connection_status_label,
-                           ble_connected ? "MAC CONNECTED" : "READY TO CONNECT");
-            set_label_text(s_connection_detail_label,
-                           ble_connected
-                               ? "This Mac is active. Pairing another Mac keeps this one remembered."
-                               : "Tap below, then open JUFF on the Mac you want to use.");
+            set_label_text(s_pairing_button_label, "+  pair a new Mac");
+            set_label_text(s_connection_status_label, ble_connected ? "MAC CONNECTED" : "READY TO CONNECT");
+            set_label_text(s_connection_detail_label, ble_connected
+                ? "Together at last. You can pair another Mac below."
+                : "Tap below, then open JUFF on the Mac you want to use.");
             lv_obj_set_style_text_color(s_connection_status_label,
-                                        lv_color_hex(ble_connected
-                                                         ? COLOR_PRIMARY
-                                                         : COLOR_BLUE),
-                                        0);
-            lv_obj_set_style_bg_color(s_pairing_button,
-                                      lv_color_hex(COLOR_PRIMARY_DEEP),
-                                      0);
+                                       lv_color_hex(ble_connected ? COLOR_PRIMARY_DEEP : COLOR_BLUE), 0);
+            lv_obj_set_style_bg_color(s_pairing_button, lv_color_hex(COLOR_PRIMARY), 0);
         }
     }
     ++s_animation_phase;
@@ -910,8 +771,8 @@ static void primary_clicked(lv_event_t *event)
         voice_state = s_voice_visual_state;
         xSemaphoreGive(s_state_mutex);
     }
-    const bool voice_ready = ble_manager_is_voice_ready()
-        || device_client_is_ready();
+    const bool ble_voice_active = ble_manager_is_voice_active();
+    const bool voice_ready = ble_voice_active || device_client_is_voice_active();
     const bool can_interrupt = audio_io_is_playing()
         || voice_state == VOICE_VISUAL_LISTENING
         || voice_state == VOICE_VISUAL_PROCESSING
@@ -919,7 +780,7 @@ static void primary_clicked(lv_event_t *event)
 
     if (voice_ready && can_interrupt) {
         ESP_LOGI(TAG, "Touch action: interrupt active voice turn");
-        if (ble_manager_is_voice_ready()) {
+        if (ble_voice_active) {
             ble_manager_send_interrupt();
         } else {
             device_client_send_interrupt();
@@ -1017,313 +878,141 @@ static lv_obj_t *create_button(lv_obj_t *screen,
     lv_obj_set_size(button, width, height);
     set_button_style(button, color);
     lv_obj_add_event_cb(button, callback, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *label = make_label(button,
-                                 text,
-                                 &lv_font_montserrat_14,
-                                 COLOR_TEXT);
-    lv_obj_center(label);
+    if (text[0] != '\0') {
+        lv_obj_t *label = make_label(button,
+                                     text,
+                                     &lv_font_montserrat_14,
+                                     COLOR_TEXT);
+        lv_obj_center(label);
+    }
     return button;
 }
 
-static lv_obj_t *create_status_chip(lv_obj_t *screen,
-                                    int x,
-                                    const char *text,
-                                    lv_obj_t **dot,
-                                    lv_obj_t **label)
+static void place(lv_obj_t *object, int x, int y, int width, int height)
 {
-    lv_obj_t *chip = lv_obj_create(screen);
-    style_panel(chip, COLOR_SURFACE, 15);
-    lv_obj_set_pos(chip, x, 328);
-    lv_obj_set_size(chip, 112, 30);
-    lv_obj_set_style_bg_opa(chip, (lv_opa_t)170, 0);
-    lv_obj_set_style_border_width(chip, 1, 0);
-    lv_obj_set_style_border_color(chip, lv_color_hex(COLOR_OFF), 0);
-    lv_obj_set_style_border_opa(chip, LV_OPA_40, 0);
+    lv_obj_set_pos(object, x, y);
+    lv_obj_set_size(object, width, height);
+}
 
-    *dot = lv_obj_create(chip);
-    style_panel(*dot, COLOR_OFF, LV_RADIUS_CIRCLE);
-    lv_obj_set_size(*dot, 8, 8);
-    lv_obj_set_pos(*dot, 12, 11);
-    lv_obj_set_style_shadow_width(*dot, 0, 0);
-
-    *label = make_label(chip,
-                        text,
-                        &lv_font_montserrat_12,
-                        COLOR_MUTED);
-    lv_obj_set_pos(*label, 29, 8);
-    return chip;
+static void main_action_clicked(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    voice_visual_state_t state = VOICE_VISUAL_IDLE;
+    char title[40], detail[96];
+    bool testing;
+    snapshot_ui_state(title, detail, &testing, &state);
+    const bool active = ble_manager_is_voice_active() || device_client_is_voice_active();
+    if (active && (audio_io_is_playing() || state == VOICE_VISUAL_LISTENING
+                  || state == VOICE_VISUAL_PROCESSING || state == VOICE_VISUAL_SPEAKING)) {
+        primary_clicked(event);
+    } else {
+        connection_pill_clicked(event);
+    }
 }
 
 static void create_ui(void)
 {
     lv_obj_t *screen = lv_scr_act();
     lv_obj_set_style_bg_color(screen, lv_color_hex(COLOR_BACKGROUND), 0);
-    lv_obj_set_style_bg_grad_color(screen,
-                                   lv_color_hex(COLOR_BACKGROUND_END),
-                                   0);
-    lv_obj_set_style_bg_grad_dir(screen, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_grad_dir(screen, LV_GRAD_DIR_NONE, 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *brand_mark = lv_obj_create(screen);
-    style_panel(brand_mark, COLOR_PRIMARY, LV_RADIUS_CIRCLE);
-    lv_obj_set_pos(brand_mark, 16, 14);
-    lv_obj_set_size(brand_mark, 38, 38);
-    lv_obj_set_style_bg_grad_color(brand_mark, lv_color_hex(COLOR_BLUE), 0);
-    lv_obj_set_style_bg_grad_dir(brand_mark, LV_GRAD_DIR_VER, 0);
-    lv_obj_set_style_shadow_width(brand_mark, 0, 0);
-    lv_obj_t *brand_mark_label = make_label(brand_mark,
-                                            "J",
-                                            &lv_font_montserrat_20,
-                                            COLOR_BACKGROUND);
-    lv_obj_center(brand_mark_label);
+    const int margin = UI_COMPACT ? 14 : 24;
+    const int header_y = UI_COMPACT ? 9 : 21;
+    lv_obj_t *brand = make_label(screen, "juff.", &lv_font_montserrat_16, COLOR_TEXT);
+    lv_obj_set_pos(brand, margin + 12, header_y + 7);
+    s_status_dot = lv_obj_create(screen);
+    style_panel(s_status_dot, COLOR_PRIMARY_DEEP, LV_RADIUS_CIRCLE);
+    place(s_status_dot, margin, header_y + 14, 5, 5);
 
-    lv_obj_t *brand = make_label(screen,
-                                 "JUFF",
-                                 &lv_font_montserrat_20,
-                                 COLOR_TEXT);
-    lv_obj_set_pos(brand, 64, 11);
-    lv_obj_t *product = make_label(screen,
-                                   "YOUR VOICE COMPANION",
-                                   &lv_font_montserrat_12,
-                                   COLOR_MUTED);
-    lv_obj_set_pos(product, 65, 37);
-
-    s_connection_pill = lv_obj_create(screen);
-    style_panel(s_connection_pill, COLOR_SURFACE, 15);
-    lv_obj_set_pos(s_connection_pill, 218, 18);
-    lv_obj_set_size(s_connection_pill, 86, 30);
-    lv_obj_set_style_bg_opa(s_connection_pill, (lv_opa_t)145, 0);
-    lv_obj_set_style_border_width(s_connection_pill, 1, 0);
-    lv_obj_set_style_border_color(s_connection_pill,
-                                  lv_color_hex(COLOR_OFF),
-                                  0);
-    s_connection_label = make_label(s_connection_pill,
-                                    LV_SYMBOL_USB "  USB",
-                                    &lv_font_montserrat_12,
-                                    COLOR_MUTED);
+    s_connection_pill = create_button(screen, LCD_WIDTH - margin - 40, header_y,
+                                      40, 34, "", COLOR_SURFACE, connection_pill_clicked);
+    s_connection_label = make_label(s_connection_pill, LV_SYMBOL_BLUETOOTH,
+                                    &lv_font_montserrat_16, COLOR_TEXT);
     lv_obj_center(s_connection_label);
-    lv_obj_add_flag(s_connection_pill, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(s_connection_pill,
-                        connection_pill_clicked,
-                        LV_EVENT_CLICKED,
-                        NULL);
 
-    s_orb_halo = lv_obj_create(screen);
-    style_panel(s_orb_halo, COLOR_BACKGROUND, LV_RADIUS_CIRCLE);
-    lv_obj_set_pos(s_orb_halo, 80, 63);
-    lv_obj_set_size(s_orb_halo, 160, 160);
-    lv_obj_set_style_bg_opa(s_orb_halo, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(s_orb_halo, 2, 0);
-    lv_obj_set_style_border_color(s_orb_halo,
-                                  lv_color_hex(COLOR_PRIMARY),
-                                  0);
-    lv_obj_set_style_border_opa(s_orb_halo, LV_OPA_30, 0);
+    s_face = companion_face_create(screen);
+    place(s_face, UI_COMPACT ? 10 : 20, UI_COMPACT ? 44 : 82,
+          LCD_WIDTH - (UI_COMPACT ? 20 : 40), UI_COMPACT ? 106 : 206);
+    lv_obj_add_flag(s_face, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_face, primary_clicked, LV_EVENT_CLICKED, NULL);
 
-    s_voice_arc = lv_arc_create(screen);
-    lv_obj_set_pos(s_voice_arc, 87, 70);
-    lv_obj_set_size(s_voice_arc, 146, 146);
-    lv_arc_set_bg_angles(s_voice_arc, 0, 360);
-    lv_arc_set_range(s_voice_arc, 0, 100);
-    lv_arc_set_value(s_voice_arc, 27);
-    lv_obj_remove_style(s_voice_arc, NULL, LV_PART_KNOB);
-    lv_obj_clear_flag(s_voice_arc, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_style_bg_opa(s_voice_arc, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_arc_width(s_voice_arc, 2, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(s_voice_arc,
-                               lv_color_hex(COLOR_OFF),
-                               LV_PART_MAIN);
-    lv_obj_set_style_arc_opa(s_voice_arc, LV_OPA_30, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(s_voice_arc, 4, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(s_voice_arc,
-                               lv_color_hex(COLOR_PRIMARY),
-                               LV_PART_INDICATOR);
+    s_main_title = make_label(screen, "hey, you.",
+                              UI_COMPACT ? &lv_font_montserrat_20 : &lv_font_montserrat_24,
+                              COLOR_TEXT);
+    place(s_main_title, margin, UI_COMPACT ? 150 : 300, LCD_WIDTH - 2 * margin,
+          UI_COMPACT ? 25 : 32);
+    lv_obj_set_style_text_align(s_main_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_main_title, LV_LABEL_LONG_DOT);
+    s_main_detail = make_label(screen, "say something. I'm here.",
+                               UI_COMPACT ? &lv_font_montserrat_12 : &lv_font_montserrat_14,
+                               COLOR_MUTED);
+    place(s_main_detail, margin, UI_COMPACT ? 179 : 339, LCD_WIDTH - 2 * margin,
+          UI_COMPACT ? 16 : 40);
+    lv_obj_set_style_text_align(s_main_detail, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_main_detail, LV_LABEL_LONG_DOT);
 
-    s_orb = lv_obj_create(screen);
-    style_panel(s_orb, COLOR_PRIMARY, LV_RADIUS_CIRCLE);
-    lv_obj_set_pos(s_orb, 104, 87);
-    lv_obj_set_size(s_orb, 112, 112);
-    lv_obj_set_style_bg_grad_color(s_orb, lv_color_hex(COLOR_BLUE), 0);
-    lv_obj_set_style_bg_grad_dir(s_orb, LV_GRAD_DIR_VER, 0);
-    lv_obj_set_style_shadow_width(s_orb, 0, 0);
-    lv_obj_add_flag(s_orb, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(s_orb, primary_clicked, LV_EVENT_CLICKED, NULL);
-    s_orb_icon = make_label(s_orb,
-                            LV_SYMBOL_AUDIO,
-                            &lv_font_montserrat_24,
-                            COLOR_TEXT);
-    lv_obj_center(s_orb_icon);
-
-    s_orb_live_dot = lv_obj_create(s_orb);
-    style_panel(s_orb_live_dot, COLOR_WARNING, LV_RADIUS_CIRCLE);
-    lv_obj_set_pos(s_orb_live_dot, 82, 82);
-    lv_obj_set_size(s_orb_live_dot, 16, 16);
-    lv_obj_set_style_border_width(s_orb_live_dot, 3, 0);
-    lv_obj_set_style_border_color(s_orb_live_dot,
-                                  lv_color_hex(COLOR_TEXT),
-                                  0);
-
-    for (unsigned index = 0; index < 7; ++index) {
-        s_wave_bars[index] = lv_obj_create(screen);
-        style_panel(s_wave_bars[index], COLOR_PRIMARY, LV_RADIUS_CIRCLE);
-        lv_obj_set_pos(s_wave_bars[index], 128 + (int)index * 10, 230);
-        lv_obj_set_size(s_wave_bars[index], 5, 7);
+    const int controls_y = UI_COMPACT ? 201 : 403;
+    const int control_height = UI_COMPACT ? 32 : 46;
+    const int brightness_width = UI_COMPACT ? 58 : 68;
+    s_primary_button = create_button(screen, margin, controls_y,
+                                      LCD_WIDTH - 3 * margin - brightness_width,
+                                      control_height, "", COLOR_PRIMARY, main_action_clicked);
+    s_primary_button_label = make_label(s_primary_button, LV_SYMBOL_BLUETOOTH "  connection",
+                                        &lv_font_montserrat_12, COLOR_TEXT);
+    lv_obj_center(s_primary_button_label);
+    lv_obj_t *brightness = create_button(screen, LCD_WIDTH - margin - brightness_width,
+                                         controls_y, brightness_width, control_height, "",
+                                         COLOR_SURFACE, brightness_clicked);
+    s_brightness_label = make_label(brightness, LV_SYMBOL_EYE_OPEN " 100",
+                                    &lv_font_montserrat_12, COLOR_TEXT);
+    lv_obj_center(s_brightness_label);
+    if (!UI_COMPACT) {
+        lv_obj_t *footer = make_label(screen, "a little presence.", &lv_font_montserrat_12, COLOR_MUTED);
+        lv_obj_align(footer, LV_ALIGN_BOTTOM_MID, 0, -12);
     }
 
-    s_main_title = make_label(screen,
-                              "Meet JUFF",
-                              &lv_font_montserrat_24,
-                              COLOR_TEXT);
-    lv_obj_set_width(s_main_title, 288);
-    lv_obj_set_style_text_align(s_main_title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_pos(s_main_title, 16, 249);
-
-    s_main_detail = make_label(screen,
-                               "Open the JUFF service on your Mac to begin",
-                               &lv_font_montserrat_14,
-                               COLOR_MUTED);
-    lv_label_set_long_mode(s_main_detail, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(s_main_detail, 286);
-    lv_obj_set_style_text_align(s_main_detail, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_pos(s_main_detail, 17, 284);
-
-    s_qwen_chip = create_status_chip(screen,
-                                     42,
-                                     "QWEN OFFLINE",
-                                     &s_qwen_dot,
-                                     &s_qwen_label);
-    s_mic_chip = create_status_chip(screen,
-                                    166,
-                                    "MIC READY",
-                                    &s_mic_dot,
-                                    &s_mic_label);
-
-    s_primary_button = create_button(screen,
-                                     16,
-                                     376,
-                                     208,
-                                     62,
-                                     "",
-                                     COLOR_SURFACE_RAISED,
-                                     primary_clicked);
-    s_primary_button_label = make_label(s_primary_button,
-                                        LV_SYMBOL_AUDIO "  JUST START TALKING",
-                                        &lv_font_montserrat_14,
-                                        COLOR_TEXT);
-    lv_obj_center(s_primary_button_label);
-
-    lv_obj_t *brightness = create_button(screen,
-                                         236,
-                                         376,
-                                         68,
-                                         62,
-                                         "",
-                                         COLOR_SURFACE_RAISED,
-                                         brightness_clicked);
-    s_brightness_label = make_label(brightness,
-                                    LV_SYMBOL_EYE_OPEN "\n100%",
-                                    &lv_font_montserrat_12,
-                                    COLOR_MUTED);
-    lv_obj_set_style_text_align(s_brightness_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_center(s_brightness_label);
-
-    lv_obj_t *footer = make_label(screen,
-                                  "PRIVATE BLE AUDIO  |  JUFF 0.5",
-                                  &lv_font_montserrat_12,
-                                  COLOR_OFF);
-    lv_obj_set_width(footer, 288);
-    lv_obj_set_style_text_align(footer, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_pos(footer, 16, 455);
-
     s_connection_overlay = lv_obj_create(screen);
-    style_panel(s_connection_overlay, 0x000000, 0);
-    lv_obj_set_pos(s_connection_overlay, 0, 0);
-    lv_obj_set_size(s_connection_overlay, LCD_WIDTH, LCD_HEIGHT);
-    lv_obj_set_style_bg_opa(s_connection_overlay, LV_OPA_70, 0);
-    lv_obj_add_flag(s_connection_overlay, LV_OBJ_FLAG_HIDDEN);
-
+    style_panel(s_connection_overlay, COLOR_TEXT, 0);
+    place(s_connection_overlay, 0, 0, LCD_WIDTH, LCD_HEIGHT);
+    lv_obj_set_style_bg_opa(s_connection_overlay, LV_OPA_50, 0);
+    lv_obj_add_flag(s_connection_overlay, LV_OBJ_FLAG_HIDDEN | LV_OBJ_FLAG_CLICKABLE);
     lv_obj_t *sheet = lv_obj_create(s_connection_overlay);
-    style_panel(sheet, COLOR_SURFACE_RAISED, 26);
-    lv_obj_set_pos(sheet, 12, 58);
-    lv_obj_set_size(sheet, 296, 378);
-    lv_obj_set_style_border_width(sheet, 1, 0);
-    lv_obj_set_style_border_color(sheet, lv_color_hex(COLOR_BLUE), 0);
-    lv_obj_set_style_border_opa(sheet, LV_OPA_30, 0);
+    style_panel(sheet, COLOR_BACKGROUND, UI_COMPACT ? 18 : 24);
+    place(sheet, UI_COMPACT ? 6 : 16, UI_COMPACT ? 6 : 76,
+          UI_COMPACT ? 228 : 288, UI_COMPACT ? 228 : 328);
+    lv_obj_add_flag(sheet, LV_OBJ_FLAG_CLICKABLE);
+    const int inner = UI_COMPACT ? 12 : 20;
+    const int content_width = UI_COMPACT ? 204 : 248;
+    lv_obj_t *heading = make_label(sheet, "a little connection.", &lv_font_montserrat_14, COLOR_TEXT);
+    lv_obj_set_pos(heading, inner, UI_COMPACT ? 16 : 22);
+    create_button(sheet, UI_COMPACT ? 182 : 232, UI_COMPACT ? 6 : 12,
+                  36, 36, LV_SYMBOL_CLOSE, COLOR_SURFACE, connection_close_clicked);
 
-    lv_obj_t *sheet_eyebrow = make_label(sheet,
-                                         LV_SYMBOL_BLUETOOTH "  CONNECTIONS",
-                                         &lv_font_montserrat_12,
-                                         COLOR_BLUE);
-    lv_obj_set_pos(sheet_eyebrow, 18, 18);
-
-    create_button(sheet,
-                  244,
-                  10,
-                  38,
-                  38,
-                  "X",
-                  COLOR_SURFACE,
-                  connection_close_clicked);
-
-    s_connection_device_label = make_label(sheet,
-                                            "JUFF",
-                                            &lv_font_montserrat_20,
-                                            COLOR_TEXT);
-    lv_obj_set_pos(s_connection_device_label, 18, 52);
-
-    s_connection_status_label = make_label(sheet,
-                                            "READY TO CONNECT",
-                                            &lv_font_montserrat_12,
-                                            COLOR_BLUE);
-    lv_obj_set_pos(s_connection_status_label, 18, 84);
-
+    s_connection_device_label = make_label(sheet, "JUFF", &lv_font_montserrat_20, COLOR_TEXT);
+    lv_obj_set_pos(s_connection_device_label, inner, UI_COMPACT ? 53 : 72);
+    s_connection_status_label = make_label(sheet, "READY TO CONNECT", &lv_font_montserrat_12, COLOR_BLUE);
+    lv_obj_set_pos(s_connection_status_label, inner, UI_COMPACT ? 80 : 105);
     lv_obj_t *divider = lv_obj_create(sheet);
-    style_panel(divider, COLOR_OFF, 1);
-    lv_obj_set_pos(divider, 18, 111);
-    lv_obj_set_size(divider, 260, 1);
-    lv_obj_set_style_bg_opa(divider, LV_OPA_40, 0);
-
-    lv_obj_t *pair_title = make_label(sheet,
-                                      "Pair another Mac",
-                                      &lv_font_montserrat_16,
-                                      COLOR_TEXT);
-    lv_obj_set_pos(pair_title, 18, 131);
-
-    s_connection_detail_label = make_label(
-        sheet,
-        "Tap below, then open JUFF on the Mac you want to use.",
-        &lv_font_montserrat_14,
-        COLOR_MUTED);
+    style_panel(divider, COLOR_OFF, 0);
+    place(divider, inner, UI_COMPACT ? 104 : 138, content_width, 1);
+    s_connection_detail_label = make_label(sheet, "Open JUFF on your Mac.",
+                                            UI_COMPACT ? &lv_font_montserrat_14 : &lv_font_montserrat_16,
+                                            COLOR_MUTED);
+    place(s_connection_detail_label, inner, UI_COMPACT ? 118 : 155,
+          content_width, UI_COMPACT ? 52 : 74);
     lv_label_set_long_mode(s_connection_detail_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(s_connection_detail_label, 260);
-    lv_obj_set_pos(s_connection_detail_label, 18, 165);
-
-    lv_obj_t *privacy_note = lv_obj_create(sheet);
-    style_panel(privacy_note, COLOR_SURFACE, 14);
-    lv_obj_set_pos(privacy_note, 18, 226);
-    lv_obj_set_size(privacy_note, 260, 48);
-    lv_obj_set_style_bg_opa(privacy_note, (lv_opa_t)180, 0);
-    lv_obj_t *privacy_label = make_label(
-        privacy_note,
-        LV_SYMBOL_OK "  Old Mac stays remembered\n     One active Mac at a time",
-        &lv_font_montserrat_12,
-        COLOR_MUTED);
-    lv_obj_set_pos(privacy_label, 12, 9);
-
-    s_pairing_button = create_button(sheet,
-                                     18,
-                                     292,
-                                     260,
-                                     56,
-                                     "",
-                                     COLOR_PRIMARY_DEEP,
-                                     pairing_clicked);
-    s_pairing_button_label = make_label(s_pairing_button,
-                                        "+  PAIR A NEW MAC",
-                                        &lv_font_montserrat_14,
-                                        COLOR_TEXT);
+    if (!UI_COMPACT) {
+        lv_obj_t *note = make_label(sheet, "Your other Mac stays remembered.",
+                                    &lv_font_montserrat_12, COLOR_MUTED);
+        lv_obj_set_pos(note, inner, 242);
+    }
+    s_pairing_button = create_button(sheet, inner, UI_COMPACT ? 181 : 270,
+                                     content_width, 36, "", COLOR_PRIMARY, pairing_clicked);
+    s_pairing_button_label = make_label(s_pairing_button, "+  pair a new Mac",
+                                        &lv_font_montserrat_12, COLOR_TEXT);
     lv_obj_center(s_pairing_button_label);
-
     refresh_status_ui();
 }
 
@@ -1342,7 +1031,7 @@ static void lvgl_task(void *argument)
         if (!first_frame_reported && s_completed_flushes > 0) {
             first_frame_reported = true;
             ESP_LOGI(TAG,
-                     "First LVGL frame transferred to the ST7796 panel");
+                     "First LVGL frame transferred to the LCD panel");
         }
         const uint64_t now = uptime_ms();
         if (now >= next_status_refresh) {
@@ -1373,7 +1062,7 @@ esp_err_t board_display_init(void)
     lv_init();
     ESP_RETURN_ON_ERROR(initialize_lcd(), TAG, "initialize LCD");
     ESP_RETURN_ON_ERROR(set_brightness(s_brightness), TAG, "enable backlight");
-    ESP_RETURN_ON_ERROR(lcd_fill_solid(0x047F), TAG, "draw LCD startup color");
+    ESP_RETURN_ON_ERROR(lcd_fill_solid(0xF77B), TAG, "draw LCD startup color");
     ESP_LOGI(TAG, "High-visibility LCD startup frame transferred");
 
     const size_t pixel_count = LCD_WIDTH * LCD_DRAW_ROWS;
@@ -1431,7 +1120,7 @@ esp_err_t board_display_init(void)
 
     s_ready = true;
     vTaskDelay(pdMS_TO_TICKS(80));
-    ESP_LOGI(TAG, "JUFF product UI ready at 320x480");
+    ESP_LOGI(TAG, "JUFF product UI ready at %dx%d", LCD_WIDTH, LCD_HEIGHT);
     return ESP_OK;
 }
 

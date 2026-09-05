@@ -40,6 +40,7 @@ export function readConfig(env = process.env) {
   }
 
   return {
+    bleDevice: String(env.JUFF_BLE_DEVICE || '').trim(),
     bridgeHost: String(env.JUFF_BRIDGE_HOST || '127.0.0.1'),
     bridgePort: integer(env.JUFF_BRIDGE_PORT, 8765, 'JUFF_BRIDGE_PORT'),
     devicePath,

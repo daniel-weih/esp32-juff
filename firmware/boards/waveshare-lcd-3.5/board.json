@@ -1,0 +1,8 @@
+{
+  "id": "waveshare-lcd-3.5",
+  "name": "Waveshare ESP32-S3-Touch-LCD-3.5",
+  "kconfig_symbol": "JUFF_BOARD_WAVESHARE_LCD_35",
+  "chip": "esp32s3",
+  "display": { "width": 320, "height": 480, "controller": "ST7796", "touch": "FT6336" },
+  "audio": { "input": "ES8311", "output": "ES8311" }
+}

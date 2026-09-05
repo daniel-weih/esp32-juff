@@ -1,5 +1,16 @@
 menu "Juff voice terminal"
 
+    choice JUFF_BOARD
+        prompt "Board model"
+        default JUFF_BOARD_WAVESHARE_LCD_35
+
+        config JUFF_BOARD_WAVESHARE_LCD_35
+            bool "Waveshare ESP32-S3-Touch-LCD-3.5"
+
+        config JUFF_BOARD_WAVESHARE_LCD_154
+            bool "Waveshare ESP32-S3-Touch-LCD-1.54 (240x240)"
+    endchoice
+
     config JUFF_WIFI_SSID
         string "Wi-Fi SSID"
         default ""
@@ -30,13 +41,44 @@ menu "Juff voice terminal"
         default 0
 
     config JUFF_AUDIO_ENABLED
-        bool "Enable onboard Waveshare ESP32-S3-Touch-LCD-3.5 audio"
+        bool "Enable onboard audio"
         default y
+        select CODEC_ES8311_SUPPORT
+        select CODEC_ES7210_SUPPORT if JUFF_BOARD_WAVESHARE_LCD_154
         help
-            Uses the microphone, codec and power amplifier built into the
-            ESP32-S3-Touch-LCD-3.5 board.
+            Uses the selected board's microphone, codec and amplifier.
+            The 1.54-inch board records through ES7210 and plays through ES8311.
 
     if JUFF_AUDIO_ENABLED
+
+        config JUFF_AUDIO_STARTUP_SELF_TEST
+            bool "Play diagnostic tones automatically at startup"
+            default n
+            help
+                Intended for bench diagnostics. Normal boots stay quiet;
+                the existing explicit audio_test command remains available.
+
+        config JUFF_VOICE_BARGE_IN
+            bool "Experimental speech interruption during playback"
+            default n
+            help
+                Experimental: hardware testing has found false interruptions.
+                Keep disabled for normal use until acoustic validation passes.
+                Use ES7210 microphone/reference on the 1.54-inch board or
+                ES8311 ADC/DAC-reference slots on the 3.5-inch board with
+                local acoustic echo cancellation. BLE audio remains half-duplex;
+                speech detection stops playback and resumes microphone upload.
+
+        config JUFF_CODEC_REFERENCE_GAIN_DB
+            int "ES7210 playback reference gain (dB)"
+            depends on JUFF_VOICE_BARGE_IN && JUFF_BOARD_WAVESHARE_LCD_154
+            range 0 30
+            default 21 if JUFF_CODEC_VOLUME > 85
+            default 24
+            help
+                The 1.54-inch board attenuates the differential DAC reference
+                by about 24 dB before physical MIC3. Configure this separately
+                from microphone gain; check reference clipping when tuning.
 
         config JUFF_CODEC_I2C_PORT
             int "ES8311 I2C controller"
@@ -46,11 +88,13 @@ menu "Juff voice terminal"
         config JUFF_CODEC_I2C_SCL_GPIO
             int "ES8311 I2C SCL GPIO"
             range 0 48
+            default 41 if JUFF_BOARD_WAVESHARE_LCD_154
             default 7
 
         config JUFF_CODEC_I2C_SDA_GPIO
             int "ES8311 I2C SDA GPIO"
             range 0 48
+            default 42 if JUFF_BOARD_WAVESHARE_LCD_154
             default 8
 
         config JUFF_CODEC_I2S_PORT
@@ -61,31 +105,37 @@ menu "Juff voice terminal"
         config JUFF_CODEC_I2S_BCLK_GPIO
             int "ES8311 I2S BCLK GPIO"
             range 0 48
+            default 9 if JUFF_BOARD_WAVESHARE_LCD_154
             default 13
 
         config JUFF_CODEC_I2S_MCLK_GPIO
             int "ES8311 I2S MCLK GPIO"
             range 0 48
+            default 8 if JUFF_BOARD_WAVESHARE_LCD_154
             default 12
 
         config JUFF_CODEC_I2S_WS_GPIO
             int "ES8311 I2S WS/LRCLK GPIO"
             range 0 48
+            default 10 if JUFF_BOARD_WAVESHARE_LCD_154
             default 15
 
         config JUFF_CODEC_I2S_DOUT_GPIO
             int "ESP32 to ES8311 data GPIO"
             range 0 48
+            default 12 if JUFF_BOARD_WAVESHARE_LCD_154
             default 16
 
         config JUFF_CODEC_I2S_DIN_GPIO
             int "ES8311 to ESP32 data GPIO"
             range 0 48
+            default 11 if JUFF_BOARD_WAVESHARE_LCD_154
             default 14
 
         config JUFF_CODEC_PA_GPIO
             int "Direct speaker amplifier GPIO (-1 for TCA9554)"
             range -1 48
+            default 7 if JUFF_BOARD_WAVESHARE_LCD_154
             default -1
 
         config JUFF_CODEC_PA_EXPANDER_ADDRESS
@@ -106,7 +156,13 @@ menu "Juff voice terminal"
         config JUFF_CODEC_MIC_GAIN_DB
             int "Microphone gain (dB)"
             range 0 42
+            default 24 if JUFF_BOARD_WAVESHARE_LCD_35 && JUFF_VOICE_BARGE_IN
             default 30
+            help
+                On ES8311 this controls ADC digital scaling, not analog PGA.
+                The large board's AEC profile uses 24 dB to reduce full-scale
+                PCM output from its own speaker. Check microphone clipping
+                and near-end speech together when changing gain or volume.
 
     endif
 

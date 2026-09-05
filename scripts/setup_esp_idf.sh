@@ -31,5 +31,6 @@ echo "Installing the ESP32-S3 toolchain"
 cat <<'EOF'
 
 ESP-IDF is installed for this repository.
-Build the firmware with: ./scripts/idf.sh build
+Build and package both hardware versions with: make firmware-build-all
+Or select one: make firmware-build-35 / make firmware-build-154
 EOF

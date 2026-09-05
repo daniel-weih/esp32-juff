@@ -7,10 +7,13 @@
 #include <string.h>
 
 #include "audio_io.h"
+#include "board_config.h"
 #include "board_display.h"
 #include "cJSON.h"
 #include "device_client.h"
 #include "esp_check.h"
+#include "esp_app_desc.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_random.h"
@@ -91,7 +94,9 @@ static uint16_t s_connection_handle = BLE_HS_CONN_HANDLE_NONE;
 static bool s_notify_enabled;
 static bool s_microphone_notify_enabled;
 static bool s_voice_ready;
+// Host input suspension and half-duplex playback have independent lifetimes.
 static bool s_input_suspended;
+static bool s_playback_suspended;
 static bool s_speaker_response_active;
 static bool s_advertising;
 static bool s_started;
@@ -244,7 +249,7 @@ static void snapshot_audio_state(bool *microphone_notify_enabled,
         *voice_ready = s_voice_ready;
     }
     if (input_suspended != NULL) {
-        *input_suspended = s_input_suspended;
+        *input_suspended = s_input_suspended || s_playback_suspended;
     }
     portEXIT_CRITICAL(&s_state_lock);
 }
@@ -261,6 +266,7 @@ static void set_link_state(uint16_t connection_handle,
         s_microphone_notify_enabled = false;
         s_voice_ready = false;
         s_input_suspended = false;
+        s_playback_suspended = false;
     }
     portEXIT_CRITICAL(&s_state_lock);
 }
@@ -280,16 +286,19 @@ static void mark_connected(uint16_t connection_handle)
 
 static size_t build_status(char *buffer, size_t buffer_size)
 {
-    const bool ble_voice = ble_manager_is_voice_ready();
-    const bool bridge_connected = ble_voice || device_client_is_connected();
-    const bool voice_ready = ble_voice || device_client_is_ready();
+    const bool ble_voice = ble_manager_is_voice_active();
+    const bool bridge_connected = ble_manager_audio_is_connected()
+        || device_client_is_connected();
+    const bool voice_ready = ble_voice || device_client_is_voice_active();
     const int length = snprintf(
         buffer,
         buffer_size,
-        "{\"type\":\"status\",\"name\":\"%s\",\"firmware\":\"0.5.0\","
+        "{\"type\":\"status\",\"name\":\"%s\",\"firmware\":\"%s\",\"board\":\"%s\","
         "\"wifiConfigured\":%s,\"wifi\":%s,\"ble\":%s,\"pairing\":%s,\"bridge\":%s,"
-        "\"voice\":%s,\"bleAudio\":%s,\"audio\":%s,\"playing\":%s}",
+        "\"voice\":%s,\"bleAudio\":%s,\"audio\":%s,\"playing\":%s,\"voiceInterrupt\":%s}",
         s_device_name,
+        esp_app_get_description()->version,
+        JUFF_BOARD_ID,
         wifi_manager_has_credentials() ? "true" : "false",
         wifi_manager_is_connected() ? "true" : "false",
         ble_manager_is_connected() ? "true" : "false",
@@ -298,7 +307,8 @@ static size_t build_status(char *buffer, size_t buffer_size)
         voice_ready ? "true" : "false",
         ble_manager_audio_is_connected() ? "true" : "false",
         audio_io_is_available() ? "true" : "false",
-        audio_io_is_playing() ? "true" : "false");
+        audio_io_is_playing() ? "true" : "false",
+        audio_io_supports_voice_barge_in() ? "true" : "false");
     if (length < 0 || (size_t)length >= buffer_size) {
         return 0;
     }
@@ -355,7 +365,7 @@ static bool notify_text(const char *text)
 
 static void notify_current_status(void)
 {
-    char status[256];
+    char status[BLE_MESSAGE_MAX_BYTES];
     if (build_status(status, sizeof(status)) > 0) {
         (void)notify_text(status);
     }
@@ -512,7 +522,7 @@ static int gatt_access(uint16_t connection_handle,
 
     if (attribute_handle == s_status_handle
         && context->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-        char status[256];
+        char status[BLE_MESSAGE_MAX_BYTES];
         const size_t length = build_status(status, sizeof(status));
         if (length == 0 || os_mbuf_append(context->om, status, length) != 0) {
             return BLE_ATT_ERR_INSUFFICIENT_RES;
@@ -850,6 +860,7 @@ static void handle_command(const char *text)
         portENTER_CRITICAL(&s_state_lock);
         s_voice_ready = microphone_notify_enabled;
         s_input_suspended = false;
+        s_playback_suspended = false;
         portEXIT_CRITICAL(&s_state_lock);
         if (microphone_notify_enabled) {
             audio_io_set_capture_enabled(true);
@@ -864,6 +875,7 @@ static void handle_command(const char *text)
         portENTER_CRITICAL(&s_state_lock);
         s_voice_ready = false;
         s_input_suspended = false;
+        s_playback_suspended = false;
         portEXIT_CRITICAL(&s_state_lock);
         reset_speaker_stream();
         board_display_set_voice_state("idle");
@@ -879,7 +891,7 @@ static void handle_command(const char *text)
             response_id = "ble-response";
         }
         portENTER_CRITICAL(&s_state_lock);
-        s_input_suspended = true;
+        s_playback_suspended = true;
         portEXIT_CRITICAL(&s_state_lock);
         board_display_set_voice_state("speaking");
         audio_io_set_capture_enabled(false);
@@ -918,12 +930,11 @@ static void handle_command(const char *text)
         board_display_set_voice_state("idle");
         const char *reason = json_string(message, "reason");
         audio_io_clear(reason == NULL ? "Mac requested clear" : reason);
-        bool voice_ready;
         portENTER_CRITICAL(&s_state_lock);
-        s_input_suspended = false;
-        voice_ready = s_voice_ready;
+        s_playback_suspended = false;
         portEXIT_CRITICAL(&s_state_lock);
-        audio_io_set_capture_enabled(voice_ready || device_client_is_ready());
+        audio_io_set_capture_enabled(ble_manager_is_voice_ready()
+                                     || device_client_is_ready());
     } else if (strcmp(type, "input.suspend") == 0) {
         portENTER_CRITICAL(&s_state_lock);
         s_input_suspended = true;
@@ -931,12 +942,11 @@ static void handle_command(const char *text)
         audio_io_set_capture_enabled(false);
         (void)notify_text("{\"type\":\"input.suspend.ack\"}");
     } else if (strcmp(type, "input.resume") == 0) {
-        bool voice_ready;
         portENTER_CRITICAL(&s_state_lock);
         s_input_suspended = false;
-        voice_ready = s_voice_ready;
         portEXIT_CRITICAL(&s_state_lock);
-        audio_io_set_capture_enabled(voice_ready || device_client_is_ready());
+        audio_io_set_capture_enabled(ble_manager_is_voice_ready()
+                                     || device_client_is_ready());
     } else if (strcmp(type, "voice.state") == 0) {
         const char *state = json_string(message, "state");
         board_display_set_voice_state(state);
@@ -950,7 +960,7 @@ static void handle_command(const char *text)
     } else if (strcmp(type, "command") == 0) {
         const char *name = json_string(message, "name");
         if (name != NULL && strcmp(name, "interrupt") == 0) {
-            if (ble_manager_is_voice_ready()) {
+            if (ble_manager_is_voice_active()) {
                 ble_manager_send_interrupt();
             } else {
                 device_client_send_interrupt();
@@ -1176,6 +1186,9 @@ esp_err_t ble_manager_start(void)
     nimble_port_freertos_init(nimble_host_task);
     s_started = true;
     ESP_LOGI(TAG, "BLE setup/control/audio transport initialized as %s", s_device_name);
+    ESP_LOGI(TAG, "Internal heap after BLE startup: free=%u, largest=%u bytes",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     return ESP_OK;
 }
 
@@ -1206,6 +1219,7 @@ esp_err_t ble_manager_start_pairing(void)
     }
     s_voice_ready = false;
     s_input_suspended = false;
+    s_playback_suspended = false;
     portEXIT_CRITICAL(&s_state_lock);
 
     reset_speaker_stream();
@@ -1301,6 +1315,14 @@ bool ble_manager_audio_is_connected(void)
         && microphone_notify_enabled;
 }
 
+bool ble_manager_is_voice_active(void)
+{
+    bool microphone_notify_enabled;
+    bool voice_ready;
+    snapshot_audio_state(&microphone_notify_enabled, &voice_ready, NULL);
+    return ble_manager_is_connected() && microphone_notify_enabled && voice_ready;
+}
+
 bool ble_manager_is_voice_ready(void)
 {
     bool microphone_notify_enabled;
@@ -1358,13 +1380,32 @@ void ble_manager_send_interrupt(void)
 {
     reset_speaker_stream();
     audio_io_clear("local BLE interrupt");
-    bool voice_ready;
     portENTER_CRITICAL(&s_state_lock);
-    s_input_suspended = false;
-    voice_ready = s_voice_ready;
+    s_playback_suspended = false;
     portEXIT_CRITICAL(&s_state_lock);
-    audio_io_set_capture_enabled(voice_ready || device_client_is_ready());
+    audio_io_set_capture_enabled(ble_manager_is_voice_ready()
+                                 || device_client_is_ready());
     (void)notify_text("{\"type\":\"interrupt\"}");
+}
+
+bool ble_manager_try_voice_interrupt(void)
+{
+    portENTER_CRITICAL(&s_state_lock);
+    const bool input_suspended = s_input_suspended;
+    portEXIT_CRITICAL(&s_state_lock);
+    if (!ble_manager_is_voice_active() || input_suspended) {
+        return false;
+    }
+    ble_manager_send_interrupt();
+    return true;
+}
+
+bool ble_manager_allows_voice_interrupt(void)
+{
+    portENTER_CRITICAL(&s_state_lock);
+    const bool input_suspended = s_input_suspended;
+    portEXIT_CRITICAL(&s_state_lock);
+    return ble_manager_is_voice_active() && !input_suspended;
 }
 
 void ble_manager_send_playback_event(const char *event_type,
@@ -1375,12 +1416,11 @@ void ble_manager_send_playback_event(const char *event_type,
     }
     if (strcmp(event_type, "playback.ended") == 0
         || strcmp(event_type, "playback.cancelled") == 0) {
-        bool voice_ready;
         portENTER_CRITICAL(&s_state_lock);
-        s_input_suspended = false;
-        voice_ready = s_voice_ready;
+        s_playback_suspended = false;
         portEXIT_CRITICAL(&s_state_lock);
-        audio_io_set_capture_enabled(voice_ready || device_client_is_ready());
+        audio_io_set_capture_enabled(ble_manager_is_voice_ready()
+                                     || device_client_is_ready());
     }
     char message[192];
     const int length = snprintf(message,
