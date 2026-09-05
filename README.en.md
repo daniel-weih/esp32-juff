@@ -2,9 +2,11 @@
 
 [简体中文](README.md) · [Architecture](docs/architecture.md) · [Firmware](firmware/README.md) · [Contributing](CONTRIBUTING.md)
 
-![JUFF interface concept running on the ESP32-S3-Touch-LCD-3.5](docs/images/juff-hero.png)
+| 3.5-inch · 320×480 | 1.54-inch · 240×240 |
+| :---: | :---: |
+| <img src="docs/images/juff-ui-3.5.png" alt="JUFF firmware UI for the large display" width="320"> | <img src="docs/images/juff-ui-1.54.png" alt="JUFF firmware UI for the small display" width="240"> |
 
-*Concept rendering based on the target development board and JUFF firmware UI.*
+*Rendered from the current firmware UI at each display's native resolution.*
 
 JUFF turns the Waveshare **ESP32-S3-Touch-LCD-3.5 / 1.54** into a touch-enabled,
 real-time voice terminal. Its default transport is encrypted Bluetooth LE:
