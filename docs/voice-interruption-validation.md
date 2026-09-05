@@ -1,6 +1,6 @@
 # Experimental voice interruption: methods and results
 
-The acoustic measurements below are historical results from experimental
+The initial acoustic measurements below are historical results from experimental
 `0.6.0-dev` firmware on the Waveshare ESP32-S3-Touch-LCD-1.54. One calibrated
 acoustic smoke test passed; broader acceptance remains incomplete. Earlier
 self-interruptions, missed near-end speech and startup failure remain part of
@@ -11,6 +11,60 @@ can be explicitly enabled for the 1.54-inch profile as described in the
 [firmware guide](../firmware/README.md). A package's `manifest.json` records its
 actual setting in `features.voice_interrupt`; a version number alone does not
 identify whether the experiment is enabled.
+
+## Buffered playback regression investigation
+
+The `0.6.8-dev` buffer/throughput tests suspended microphone input and used
+low-volume tones. They did not validate acoustic interruption. A subsequent
+automated test kept local AEC/VAD enabled and replayed a 22.24-second synthesized
+voice fixture through the device at its normal configured speaker volume.
+
+The same fixture caused an unwanted interruption around 11.8 seconds on both
+the previous `0.6.7-dev` firmware and the buffered implementation. Keeping TX/RX
+clocks continuous between natural responses did not by itself resolve this
+case. Neither AGGR nor VERYAGGR nonlinear suppression reliably resolved it, so
+the small board retains NORMAL. These observations establish a reproducible
+residual-echo failure, not a proven change in the physical echo path.
+
+At one unwanted interruption, the current raw microphone/reference/clean AEC
+block RMS values were 7133/1042/281. The existing 180-RMS floor still accepted
+the residual speech. These raw and processed block measurements help compare
+signal levels; they are not a sample-aligned double-talk measurement.
+
+The `0.6.9-dev` small-board candidate adds a roughly 128 ms window of complete
+AEC blocks. When its reference RMS is at least 80, accepted speech must retain
+at least 1% of the raw microphone power; otherwise the original speech candidate
+remains blocked. The existing 120 ms VAD candidate duration is unchanged. This
+is an empirical residual-echo rejection rule, not a general double-talk
+classifier or an estimate of the DSP's exact delay. The large board retains
+its separate detection parameters.
+
+Interruption recovery also exposed lost BLE microphone fragments: at the
+configured 100 Hz scheduler rate, the old 2 ms retry delay converted to zero
+ticks. The fix waits at least one tick after rejection, retries only rejected
+fragments, and allows 200 ms per fragment / 400 ms per complete frame. A
+12-frame queue accommodates history bursts. The small board retains 800 ms
+of pre-interruption speech instead of 300 ms; the large board stays at 300 ms.
+
+Controlled local results, with microphone detection enabled throughout:
+
+| Case | Observation |
+| --- | --- |
+| Five complete 22.24-second synthesized responses | All completed, no unwanted interruption; three at source gain 1.0, one at 0.65, one at 0.35 |
+| Two normal-level independent synthetic interruptions | Both stopped playback; local offline ASR recovered both parts of the known opening phrase |
+| Two quieter independent synthetic interruptions | Both produced stop events, but one responded late and did not preserve an identifiable opening phrase; the other recovered both parts |
+| Transport during these runs | Zero reported playback underruns/rejected speaker bytes and no microphone-congestion drops |
+
+Near-source calibration measured approximately 1421 RMS at the loudest 100 ms
+microphone frame for the normal level and 715 for the quieter level. These are
+device PCM measurements, not sound-pressure or distance measurements. Stop
+events in the quieter test arrived about 2.55 s and 0.91 s after launching the
+independent playback process; process launch is not measured acoustic onset.
+The earlier diagnostic firmware also responded late in the quieter first
+round. This remains an acceptance gap: a stop event alone does not establish
+usable recovered speech. The results above do not establish long-term,
+far-distance or real-user reliability. Test microphone recordings and ASR
+outputs remain local ignored artifacts; none were uploaded for transcription.
 
 ## Test boundaries
 

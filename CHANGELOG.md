@@ -5,7 +5,75 @@ All notable changes to JUFF are documented here. The project follows
 
 ## [Unreleased]
 
-Current firmware development version: `0.6.3-dev`.
+Current firmware development version: `0.6.10-dev`.
+
+### 0.6.10-dev transport review fixes
+
+- Serialize BLE credit snapshots through notification publication so concurrent
+  updates cannot appear out of order and falsely cancel speech on the Mac.
+- Apply bounded Wi-Fi receive backpressure when the playback buffer is full.
+  Cancel an incomplete response on failure and prevent delayed audio from
+  entering or cancelling a newer response.
+- Send an ordered microphone reset boundary after stream changes or a partially
+  transmitted frame. The updated Mac helper discards any incomplete old frame
+  before assembling the next audio, while retaining support for older firmware.
+- Refresh both native-resolution UI previews from the current firmware renderer,
+  including the small board's battery percentage, plus its charging preview.
+
+### 0.6.9-dev residual echo and interruption recovery
+
+- Add a small-board residual-echo check using a window of complete AEC blocks
+  before accepting a voice interruption; retain the existing VAD timing and
+  the large board's separate detection parameters.
+- Preserve 800 ms of small-board speech history so interruption recovery can
+  include more of the opening words; keep 300 ms on the large board.
+- Retry congested BLE microphone fragments with a real scheduler delay and a
+  200 ms bound. Size the queue for history bursts and discard queued audio at
+  mute, session and connection boundaries.
+- Keep shared audio clocks running between naturally completed responses.
+
+### 0.6.8-dev buffered BLE playback
+
+- Buffer up to four seconds of decoded speech in PSRAM on either hardware profile.
+  Prefill 300 ms before playback; completed short responses start without waiting
+  for that threshold. Refill 250 ms after an underrun, with a 600 ms wait ceiling.
+- Negotiate receiver credits so the Mac can fill available device memory without
+  a fixed sending rate. Queue excess synthesized audio on the Mac, within a 2 MiB
+  encoded-audio limit, and retain compatibility with older firmware.
+- Fence packets with stream IDs and byte offsets, serialize responses through
+  audible completion, and clear pending speech on interruption. Reject missing
+  data or invalid credits instead of playing an incomplete response silently.
+- Report playback queue depth, underruns, rejected data, and negotiated BLE PHY.
+
+### 0.6.7-dev battery measurement and continuous percentages
+
+- Keep numeric percentages and fill visible during charging and power transitions.
+  Show 0 as a number, use 1% display increments, and reserve `--` for unavailable data.
+- Use the ESP32-S3's lower-error 6 dB ADC range, with matching eFuse calibration,
+  for the small board's divided battery voltage. External divider tolerance and
+  the uncharacterized cell still limit voltage and capacity accuracy.
+- Reject isolated voltage spikes with a three-sample median. Clear filter history
+  at charge-state transitions so the next real sample replaces the previous estimate.
+- Include battery voltage, estimate, and charging state in small-board BLE status
+  for logging during battery operation; omit unsupported readings on the large board.
+
+### 0.6.5-dev small-board battery indicator
+
+- Add a compact battery icon with the estimated percentage inside and a fill
+  level that follows the estimate. Use green with a lightning bolt when charging
+  and red at 20% or below; unavailable readings show `--`.
+- Read the small board's calibrated battery voltage and charge-status signal
+  on a separate low-priority task, with filtering and display hysteresis.
+  Keep battery sampling off the audio, display, and power-button tasks.
+- Retain the large board's existing header without showing unsupported readings.
+
+### 0.6.4-dev small-board power key
+
+- Hold the 1.54-inch board's PWR key for 3 seconds, then release to shut down.
+  Stop microphone capture and playback, mute the amplifier, and blank the display.
+- Release the battery power latch; use deep sleep with PWR wakeup when USB
+  continues supplying power. Ignore a held startup key until its first release.
+- Keep BOOT interruption and the 3.5-inch hardware profile unchanged.
 
 ### 0.6.3-dev publication cleanup
 

@@ -101,6 +101,21 @@ class VoiceFrontendTest(unittest.TestCase):
                     raise AssertionError(f"AEC mock enum does not match installed SDK: {name}")
         for name, text in MOCK_HEADERS.items():
             (output / name).write_text(text)
+        # Read-only test hooks inspect guard state after real stream boundaries;
+        # production builds have no extra exported functions or test switches.
+        test_source = output / "voice_frontend_under_test.c"
+        test_source.write_text((ROOT / "firmware/main/voice_frontend.c").read_text() + """
+#if CONFIG_JUFF_VOICE_BARGE_IN
+size_t frontend_test_guard_samples(void) {
+#if CONFIG_JUFF_BOARD_WAVESHARE_LCD_154
+    return s_echo_guard_window.samples;
+#else
+    return 0;
+#endif
+}
+bool frontend_test_guard_allows(void) { return echo_guard_allows_interruption(); }
+#endif
+""")
         cls.executables = {}
         for board, small in (("waveshare-lcd-3.5", False), ("waveshare-lcd-1.54", True)):
             executable = output / f"voice_frontend_{board}"
@@ -110,7 +125,7 @@ class VoiceFrontendTest(unittest.TestCase):
                  f"-DCONFIG_JUFF_BOARD_WAVESHARE_LCD_35={int(not small)}",
                  f"-DCONFIG_JUFF_BOARD_WAVESHARE_LCD_154={int(small)}",
                  "-I", str(output), "-I", str(ROOT / "firmware/main"),
-                 str(ROOT / "firmware/main/voice_frontend.c"),
+                 str(test_source),
                  str(Path(__file__).with_name("voice_frontend_harness.c")),
                  "-lm", "-o", str(executable)], capture_output=True, text=True)
             if result.returncode:
@@ -132,6 +147,29 @@ class VoiceFrontendTest(unittest.TestCase):
 
     def test_raw_microphone_peak_and_fullscale_telemetry_reset_between_windows(self):
         self.run_scenario("mic-telemetry")
+
+    def test_interrupt_telemetry_keeps_pre_aec_inputs_and_only_current_candidate(self):
+        self.run_scenario("interrupt-telemetry")
+        for chunk in (256, 512):
+            with self.subTest(chunk=chunk):
+                self.run_scenario("interrupt-telemetry-block", chunk)
+
+    def test_interrupt_telemetry_handles_zero_raw_energy_without_division(self):
+        self.run_scenario("interrupt-telemetry-zero", 512)
+
+    def test_small_board_rejects_low_power_echo_without_changing_large_board(self):
+        self.run_scenario("echo-guard-low", 512)
+
+    def test_echo_guard_preserves_normal_soft_and_quiet_reference_speech(self):
+        for scenario in ("echo-guard-normal", "echo-guard-soft", "echo-guard-quiet"):
+            with self.subTest(scenario=scenario): self.run_scenario(scenario, 512)
+
+    def test_echo_guard_uses_complete_blocks_and_resets_at_stream_boundaries(self):
+        for chunk in (160, 256, 512):
+            with self.subTest(chunk=chunk): self.run_scenario("echo-guard-window", chunk)
+
+    def test_echo_guard_one_percent_boundary_and_full_scale_products(self):
+        self.run_scenario("echo-guard-boundary", 512)
 
     def test_history_and_pending_use_psram_with_full_sample_capacities(self):
         self.run_scenario("allocation-caps")
@@ -178,7 +216,7 @@ class VoiceFrontendTest(unittest.TestCase):
     def test_rejected_interrupt_does_not_upload_playback_history(self):
         self.run_scenario("rejected")
 
-    def test_accepted_interrupt_uploads_ordered_300ms_history_without_duplication(self):
+    def test_accepted_interrupt_uploads_ordered_board_history_without_duplication(self):
         self.run_scenario("history")
 
     def test_full_pending_history_does_not_drop_the_first_live_frame(self):

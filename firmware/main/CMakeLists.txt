@@ -6,6 +6,9 @@ idf_component_register(
         "ble_manager.c"
         "board_display.c"
         "companion_face.c"
+        "battery_indicator.c"
+        "battery_monitor.c"
+        "power_manager.c"
         "device_client.c"
         "usb_provisioning.c"
         "wifi_manager.c"
@@ -13,7 +16,9 @@ idf_component_register(
     REQUIRES
         bt
         esp_app_format
+        esp_adc
         esp_event
+        esp_hw_support
         esp_netif
         esp_wifi
         esp_codec_dev

@@ -27,7 +27,8 @@ class AudioCaptureTest(unittest.TestCase):
         output = Path(cls.temporary.name)
         (output / "esp_err.h").write_text("typedef int esp_err_t;\n")
         source = (ROOT / "firmware/main/audio_io.c").read_text()
-        (output / "capture_task.inc").write_text(function(source, "capture_task"))
+        (output / "capture_task.inc").write_text(function(source, "deliver_captured_pcm")
+                                                + "\n" + function(source, "capture_task"))
         (output / "resample.inc").write_text(function(source, "resample_24k_to_16k"))
         cls.executables = {}
         for small in (False, True):
@@ -75,6 +76,14 @@ class AudioCaptureTest(unittest.TestCase):
         for small in (False, True):
             with self.subTest(small=small):
                 self.run_scenario(small, False, "fallback")
+
+    def test_shutdown_during_read_discards_audio_and_stops_capture(self):
+        for small in (False, True):
+            for aec in (False, True):
+                for scenario in (("fallback-shutdown", "frontend-shutdown")
+                                 if aec else ("fallback-shutdown",)):
+                    with self.subTest(small=small, aec=aec, scenario=scenario):
+                        self.run_scenario(small, aec, scenario)
 
 
 if __name__ == "__main__":

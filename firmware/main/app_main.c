@@ -1,6 +1,7 @@
 #include <inttypes.h>
 
 #include "audio_io.h"
+#include "battery_monitor.h"
 #include "ble_manager.h"
 #include "board_display.h"
 #include "board_config.h"
@@ -14,6 +15,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "power_manager.h"
 #include "sdkconfig.h"
 #include "usb_provisioning.h"
 #include "wifi_manager.h"
@@ -130,15 +132,7 @@ static void log_hardware(void)
 
 void app_main(void)
 {
-#if CONFIG_JUFF_BOARD_WAVESHARE_LCD_154
-    // Latch the 1.54-inch board's power rail when running from its battery.
-    ESP_ERROR_CHECK(gpio_set_level(GPIO_NUM_2, 1));
-    const gpio_config_t power_config = {
-        .pin_bit_mask = 1ULL << GPIO_NUM_2,
-        .mode = GPIO_MODE_OUTPUT,
-    };
-    ESP_ERROR_CHECK(gpio_config(&power_config));
-#endif
+    power_manager_hold();
     ESP_LOGI(TAG, "JUFF voice companion %s starting", esp_app_get_description()->version);
     ESP_LOGI(TAG, "Board: %s (%s)", JUFF_BOARD_NAME, JUFF_BOARD_ID);
     log_hardware();
@@ -164,6 +158,8 @@ void app_main(void)
                  "LCD/touch initialization failed: %s",
                  esp_err_to_name(display_error));
     }
+    // Reserve the LCD's contiguous DMA buffers before starting another task.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(battery_monitor_init());
 
 #if CONFIG_JUFF_AUDIO_STARTUP_SELF_TEST
     if (error == ESP_OK && !wifi_manager_has_credentials()) {
@@ -199,6 +195,8 @@ void app_main(void)
     }
 
     error = wifi_manager_start();
+    // Start after radio initialization so shutdown never races their startup.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(power_manager_start());
     if (error != ESP_OK) {
         ESP_LOGW(TAG,
                  "Wi-Fi not started. Configure Juff voice terminal > Wi-Fi SSID, then rebuild.");

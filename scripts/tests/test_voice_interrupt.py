@@ -49,7 +49,8 @@ class VoiceInterruptTest(unittest.TestCase):
             "device_client": ["device_client_is_voice_active", "device_client_is_ready",
                               "device_client_is_connected", "device_client_send_interrupt",
                               "device_client_try_voice_interrupt"],
-            "board_display": ["primary_clicked"],
+            "board_display": ["display_shutdown_state", "board_display_prepare_shutdown",
+                              "primary_clicked"],
             "app_main": ["microphone_pcm", "send_interrupt"],
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -57,8 +58,14 @@ class VoiceInterruptTest(unittest.TestCase):
             (output / "esp_err.h").write_text("typedef int esp_err_t;\n")
             for module, names in selections.items():
                 source = (ROOT / "firmware/main" / f"{module}.c").read_text()
+                preamble = ""
+                if module == "board_display":
+                    shutdown = re.search(r"typedef enum \{\s*DISPLAY_RUNNING,.*?"
+                                         r"\} display_shutdown_state_t;", source, re.S)
+                    self.assertIsNotNone(shutdown, "Missing display shutdown state")
+                    preamble = shutdown.group(0) + "\nstatic display_shutdown_state_t s_shutdown_state;\n"
                 (output / f"{module}.inc").write_text(
-                    "\n\n".join(function(source, name) for name in names))
+                    preamble + "\n\n".join(function(source, name) for name in names))
             result = subprocess.run(
                 [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
                  "-Wno-unused-parameter", "-I", str(output),

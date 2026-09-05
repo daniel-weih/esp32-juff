@@ -1,4 +1,5 @@
 import CoreBluetooth
+import CoreFoundation
 import Foundation
 
 private let serviceUUID = CBUUID(string: "B8A5FCA1-8A0F-4DB1-9C6C-7B5B6C49A001")
@@ -8,11 +9,6 @@ private let microphoneUUID = CBUUID(string: "B8A5FCA1-8A0F-4DB1-9C6C-7B5B6C49A00
 private let speakerUUID = CBUUID(string: "B8A5FCA1-8A0F-4DB1-9C6C-7B5B6C49A005")
 private let deviceNamePrefix = "JUFF-"
 private let maximumMessageBytes = 512
-private let microphoneMuLawFrameBytes = 1600
-private let maximumQueuedSpeakerBytes = 2 * 1024 * 1024
-private let speakerTransportBytesPerSecond = 25_200.0
-private let speakerInitialBurstBytes = 7_200.0
-private let speakerMinimumPacingDelay = 0.004
 
 private let allowedControlTypes: Set<String> = [
     "status",
@@ -38,6 +34,15 @@ private func emit(_ line: String) {
 private func oneLine(_ value: String) -> String {
     value.replacingOccurrences(of: "\r", with: " ")
         .replacingOccurrences(of: "\n", with: " ")
+}
+
+private func protocolUInt32(_ value: Any?) -> UInt32? {
+    guard let number = value as? NSNumber,
+          CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+    let value = number.doubleValue
+    guard value.isFinite, value >= 0, value <= Double(UInt32.max),
+          value.rounded(.towardZero) == value else { return nil }
+    return UInt32(value)
 }
 
 private func normalizedMessage(_ line: String) -> Data? {
@@ -125,6 +130,14 @@ private func muLawToLinearPCM(_ encoded: Data) -> Data {
 }
 
 private func runSelfTest() -> Bool {
+    guard protocolUInt32(NSNumber(value: UInt32.max)) == UInt32.max,
+          protocolUInt32(NSNumber(value: true)) == nil,
+          protocolUInt32(NSNumber(value: -1)) == nil,
+          protocolUInt32(NSNumber(value: 1.5)) == nil,
+          protocolUInt32("1") == nil else {
+        emit("SELFTEST failed:flow-number")
+        return false
+    }
     guard serviceUUID.uuidString == "B8A5FCA1-8A0F-4DB1-9C6C-7B5B6C49A001",
           controlUUID.uuidString == "B8A5FCA1-8A0F-4DB1-9C6C-7B5B6C49A002",
           statusUUID.uuidString == "B8A5FCA1-8A0F-4DB1-9C6C-7B5B6C49A003",
@@ -163,6 +176,14 @@ private func runSelfTest() -> Bool {
 }
 
 private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
+    private struct ControlWrite {
+        let data: Data
+        let type: String
+        var token: SpeakerTransport.Token? = nil
+        var isBarrier: Bool {
+            token != nil || type == "playback.clear" || type == "voice.deactivated"
+        }
+    }
     private let targetName: String?
     private let exitAfterAcknowledgement: String?
     private var manager: CBCentralManager!
@@ -172,22 +193,19 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
     private var microphoneCharacteristic: CBCharacteristic?
     private var speakerCharacteristic: CBCharacteristic?
     private var retryWorkItem: DispatchWorkItem?
-    private var queuedMessages: [Data] = []
-    private var deferredControlMessages: [Data] = []
-    private var activeMessage: Data?
+    private var queuedMessages: [ControlWrite] = []
+    private var activeMessage: ControlWrite?
     private var pendingChunks: [Data] = []
-    private var speakerPayloads: [Data] = []
-    private var speakerPayloadOffset = 0
-    private var queuedSpeakerBytes = 0
-    private var speakerSendBudget = speakerInitialBurstBytes
-    private var speakerBudgetUpdatedAt = ProcessInfo.processInfo.systemUptime
+    private let speakerTransport = SpeakerTransport()
     private var speakerPacingWorkItem: DispatchWorkItem?
+    private var speakerWatchdogWorkItem: DispatchWorkItem?
     private var readyToWrite = false
     private var writeInProgress = false
+    private var controlWriteStartedAt = 0.0
     private var statusNotifying = false
     private var microphoneNotifying = false
     private var notificationBuffer = ""
-    private var microphoneBuffer = Data()
+    private let microphoneTransport = MicrophoneTransport()
     private var lastState = ""
     private var stopping = false
 
@@ -216,31 +234,55 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
                     report("rejected-audio")
                     return
                 }
-                enqueueSpeakerAudio(linearPCMToMuLaw(audio))
+                switch speakerTransport.enqueueAudio(linearPCMToMuLaw(audio),
+                                                       responseID: dictionary["responseId"] as? String) {
+                case .accepted:
+                    drainSpeakerWrites()
+                case .stale:
+                    break
+                case .overflow:
+                    failSpeakerStream("speaker-overrun")
+                }
                 return
             }
-            if type == "audio.begin" {
-                resetSpeakerPacing()
-            }
-            if type == "audio.done", let message = normalizedMessage(source) {
-                deferredControlMessages.append(message)
+            if type == "audio.begin", let message = normalizedMessage(source) {
+                if !speakerTransport.enqueueBegin(id: dictionary["responseId"] as? String ?? "ble-response",
+                                                   message: message) {
+                    report("rejected-audio-begin", repeatable: true)
+                }
                 drainSpeakerWrites()
                 return
             }
-            if type == "playback.clear" {
-                speakerPayloads.removeAll(keepingCapacity: true)
-                speakerPayloadOffset = 0
-                queuedSpeakerBytes = 0
-                deferredControlMessages.removeAll(keepingCapacity: true)
-                resetSpeakerPacing()
+            if type == "audio.done", let message = normalizedMessage(source) {
+                if !speakerTransport.enqueueEnd(responseID: dictionary["responseId"] as? String,
+                                                 message: message) {
+                    report("rejected-audio-done", repeatable: true)
+                }
+                drainSpeakerWrites()
+                return
+            }
+            if type == "playback.clear" || type == "voice.deactivated" {
+                speakerTransport.clear()
+                cancelSpeakerPacing()
+                queuedMessages.removeAll { $0.token != nil || $0.type == "voice.state"
+                    || $0.type == type }
+                guard let message = normalizedMessage(source) else {
+                    report("rejected-message")
+                    return
+                }
+                queuedMessages.insert(ControlWrite(data: message, type: type), at: 0)
+                beginWriteIfPossible()
+                return
+            }
+            if let message = normalizedMessage(source) {
+                if type == "voice.state" { queuedMessages.removeAll { $0.type == type } }
+                queuedMessages.append(ControlWrite(data: message, type: type))
+                beginWriteIfPossible()
+                drainSpeakerWrites()
+                return
             }
         }
-        guard let message = normalizedMessage(line) else {
-            report("rejected-message")
-            return
-        }
-        queuedMessages.append(message)
-        beginWriteIfPossible()
+        report("rejected-message")
     }
 
     func stop(exitCode: Int32? = nil) {
@@ -251,6 +293,8 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
         retryWorkItem?.cancel()
         speakerPacingWorkItem?.cancel()
         speakerPacingWorkItem = nil
+        speakerWatchdogWorkItem?.cancel()
+        speakerWatchdogWorkItem = nil
         manager.stopScan()
         if let peripheral {
             manager.cancelPeripheralConnection(peripheral)
@@ -285,12 +329,13 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
             self.statusNotifying = false
             self.microphoneNotifying = false
             self.pendingChunks.removeAll()
-            self.speakerPayloads.removeAll()
-            self.speakerPayloadOffset = 0
-            self.queuedSpeakerBytes = 0
-            self.resetSpeakerPacing()
-            self.deferredControlMessages.removeAll()
-            self.microphoneBuffer.removeAll(keepingCapacity: true)
+            self.speakerTransport.resetConnection()
+            self.queuedMessages.removeAll { $0.token != nil || $0.type == "voice.state" }
+            self.cancelSpeakerPacing()
+            self.speakerWatchdogWorkItem?.cancel()
+            self.speakerWatchdogWorkItem = nil
+            self.notificationBuffer = ""
+            self.microphoneTransport.reset()
             self.report("scanning")
             self.manager.scanForPeripherals(
                 withServices: [serviceUUID],
@@ -316,7 +361,7 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
             20,
             peripheral.maximumWriteValueLength(for: .withResponse)
         )
-        pendingChunks = chunks(of: message, maximumLength: maximumLength)
+        pendingChunks = chunks(of: message.data, maximumLength: maximumLength)
         guard !pendingChunks.isEmpty else {
             activeMessage = nil
             return
@@ -330,14 +375,19 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
         characteristic: CBCharacteristic
     ) {
         guard !pendingChunks.isEmpty else {
+            let token = activeMessage?.token
             writeInProgress = false
             activeMessage = nil
+            if let token {
+                speakerTransport.controlCompleted(token, now: ProcessInfo.processInfo.systemUptime)
+            }
             report("sent", repeatable: true)
             beginWriteIfPossible()
             drainSpeakerWrites()
             return
         }
         let chunk = pendingChunks.removeFirst()
+        controlWriteStartedAt = ProcessInfo.processInfo.systemUptime
         peripheral.writeValue(chunk, for: characteristic, type: .withResponse)
     }
 
@@ -355,35 +405,13 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
         }
     }
 
-    private func enqueueSpeakerAudio(_ audio: Data) {
-        guard queuedSpeakerBytes + audio.count <= maximumQueuedSpeakerBytes else {
-            report("speaker-overrun", repeatable: true)
-            return
-        }
-        speakerPayloads.append(audio)
-        queuedSpeakerBytes += audio.count
-        drainSpeakerWrites()
-    }
-
-    private func resetSpeakerPacing() {
+    private func cancelSpeakerPacing() {
         speakerPacingWorkItem?.cancel()
         speakerPacingWorkItem = nil
-        speakerSendBudget = speakerInitialBurstBytes
-        speakerBudgetUpdatedAt = ProcessInfo.processInfo.systemUptime
-    }
-
-    private func updateSpeakerSendBudget() {
-        let now = ProcessInfo.processInfo.systemUptime
-        let elapsed = max(0, now - speakerBudgetUpdatedAt)
-        speakerBudgetUpdatedAt = now
-        speakerSendBudget = min(
-            speakerInitialBurstBytes,
-            speakerSendBudget + elapsed * speakerTransportBytesPerSecond
-        )
     }
 
     private func scheduleSpeakerDrain(after delay: TimeInterval) {
-        guard speakerPacingWorkItem == nil, !speakerPayloads.isEmpty else {
+        guard speakerPacingWorkItem == nil, speakerTransport.hasPendingResponse else {
             return
         }
         let work = DispatchWorkItem { [weak self] in
@@ -395,69 +423,130 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
         }
         speakerPacingWorkItem = work
         DispatchQueue.main.asyncAfter(
-            deadline: .now() + max(speakerMinimumPacingDelay, delay),
+            deadline: .now() + max(0.004, delay),
             execute: work
         )
     }
 
+    private func failSpeakerStream(_ reason: String) {
+        speakerTransport.clear()
+        cancelSpeakerPacing()
+        queuedMessages.removeAll { $0.token != nil || $0.type == "voice.state"
+            || $0.type == "status" || $0.type == "playback.clear" }
+        if let status = normalizedMessage("{\"type\":\"status\"}") {
+            queuedMessages.insert(ControlWrite(data: status, type: "status"), at: 0)
+        }
+        if let clear = normalizedMessage("{\"type\":\"playback.clear\",\"reason\":\"speaker-flow-failed\"}") {
+            queuedMessages.insert(ControlWrite(data: clear, type: "playback.clear"), at: 0)
+        }
+        report(reason, repeatable: true)
+        if writeInProgress,
+           ProcessInfo.processInfo.systemUptime - controlWriteStartedAt >= 10,
+           let peripheral {
+            // An unacknowledged control write cannot safely be skipped midway
+            // through a newline-framed message. Reconnect to clear that barrier.
+            manager.cancelPeripheralConnection(peripheral)
+            return
+        }
+        beginWriteIfPossible()
+    }
+
+    private func scheduleSpeakerWatchdog() {
+        guard speakerWatchdogWorkItem == nil, readyToWrite,
+              speakerTransport.hasPendingResponse else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.speakerWatchdogWorkItem = nil
+            if self.speakerTransport.stalled(now: ProcessInfo.processInfo.systemUptime) {
+                self.failSpeakerStream("speaker-flow-timeout")
+            } else if self.speakerTransport.hasPendingResponse {
+                self.scheduleSpeakerWatchdog()
+            }
+        }
+        speakerWatchdogWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
+    }
+
     private func drainSpeakerWrites() {
         guard readyToWrite,
-              !writeInProgress,
-              activeMessage == nil,
               let peripheral,
               let speakerCharacteristic else {
             return
         }
-        if !queuedMessages.isEmpty {
-            beginWriteIfPossible()
-            return
-        }
-
+        scheduleSpeakerWatchdog()
+        beginWriteIfPossible()
+        // Ordinary status/UI controls may coexist with PCM. Stream boundaries
+        // must finish their acknowledged control write before more audio.
+        guard activeMessage?.isBarrier != true,
+              !queuedMessages.contains(where: { $0.isBarrier }) else { return }
         let maximumLength = max(
             20,
             peripheral.maximumWriteValueLength(for: .withoutResponse)
         )
-        updateSpeakerSendBudget()
-        while peripheral.canSendWriteWithoutResponse, !speakerPayloads.isEmpty {
-            let payload = speakerPayloads[0]
-            let remaining = payload.count - speakerPayloadOffset
-            let length = min(maximumLength, remaining)
-            if speakerSendBudget < Double(length) {
-                let delay = (Double(length) - speakerSendBudget)
-                    / speakerTransportBytesPerSecond
-                scheduleSpeakerDrain(after: delay)
-                break
-            }
-            let end = speakerPayloadOffset + length
-            let chunk = payload.subdata(in: speakerPayloadOffset..<end)
-            peripheral.writeValue(chunk, for: speakerCharacteristic, type: .withoutResponse)
-            speakerPayloadOffset = end
-            queuedSpeakerBytes -= length
-            speakerSendBudget -= Double(length)
-            if speakerPayloadOffset == payload.count {
-                speakerPayloads.removeFirst()
-                speakerPayloadOffset = 0
+        while let action = speakerTransport.nextAction(
+            maximumPacketBytes: maximumLength,
+            canSendAudio: peripheral.canSendWriteWithoutResponse,
+            now: ProcessInfo.processInfo.systemUptime) {
+            switch action {
+            case .audio(let packet):
+                peripheral.writeValue(packet, for: speakerCharacteristic, type: .withoutResponse)
+            case .control(let control):
+                let type = control.token.kind == .begin ? "audio.begin" : "audio.done"
+                queuedMessages.insert(ControlWrite(data: control.data, type: type,
+                                                    token: control.token), at: 0)
+                beginWriteIfPossible()
+                return
+            case .rejected(let reason):
+                failSpeakerStream(reason)
+                return
             }
         }
-
-        if speakerPayloads.isEmpty, !deferredControlMessages.isEmpty {
-            speakerPacingWorkItem?.cancel()
-            speakerPacingWorkItem = nil
-            queuedMessages.append(contentsOf: deferredControlMessages)
-            deferredControlMessages.removeAll(keepingCapacity: true)
-            beginWriteIfPossible()
-        } else if speakerPayloads.isEmpty {
-            speakerPacingWorkItem?.cancel()
-            speakerPacingWorkItem = nil
+        if peripheral.canSendWriteWithoutResponse,
+           let delay = speakerTransport.pacingDelay(maximumPacketBytes: maximumLength,
+                                                   now: ProcessInfo.processInfo.systemUptime) {
+            scheduleSpeakerDrain(after: delay)
+        } else {
+            cancelSpeakerPacing()
         }
     }
 
     private func handleDeviceLine(_ line: String) {
         emit("DEVICE " + line)
-        guard let expected = exitAfterAcknowledgement,
-              let data = line.data(using: .utf8),
+        guard let data = line.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              object["type"] as? String == "ack",
+              let type = object["type"] as? String else { return }
+        if type == "microphone.reset" {
+            microphoneTransport.reset()
+        } else if type == "status" {
+            speakerTransport.setCapability(protocolUInt32(object["speakerFlow"]) == 1)
+            drainSpeakerWrites()
+        } else if type == "speaker.credit" {
+            if let responseID = object["responseId"] as? String,
+               let streamID = protocolUInt32(object["streamId"]), streamID != 0,
+               let received = protocolUInt32(object["received"]),
+               let limit = protocolUInt32(object["limit"]),
+               let state = object["state"] as? String {
+                if speakerTransport.receiveCredit(responseID: responseID, streamID: streamID,
+                    received: received, limit: limit, state: state,
+                    now: ProcessInfo.processInfo.systemUptime) == .invalid {
+                    failSpeakerStream("speaker-credit-invalid")
+                }
+                drainSpeakerWrites()
+            } else {
+                report("speaker-credit-invalid")
+            }
+        } else if type == "playback.ended" || type == "playback.cancelled",
+                  let responseID = object["responseId"] as? String {
+            speakerTransport.receivePlaybackEnd(responseID: responseID,
+                                                 cancelled: type == "playback.cancelled")
+            drainSpeakerWrites()
+        } else if type == "ack", object["ok"] as? Bool == false,
+                  let request = object["request"] as? String,
+                  (request == "audio.begin" || request == "audio.done"),
+                  speakerTransport.hasPendingResponse {
+            failSpeakerStream(request == "audio.begin" ? "speaker-begin-rejected" : "speaker-end-rejected")
+        }
+        guard let expected = exitAfterAcknowledgement, type == "ack",
               object["request"] as? String == expected else {
             return
         }
@@ -542,10 +631,17 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
         guard !stopping else {
             return
         }
-        if let activeMessage {
+        readyToWrite = false
+        speakerTransport.resetConnection()
+        cancelSpeakerPacing()
+        speakerWatchdogWorkItem?.cancel()
+        speakerWatchdogWorkItem = nil
+        queuedMessages.removeAll { $0.token != nil || $0.type == "voice.state" }
+        notificationBuffer = ""
+        if let activeMessage, activeMessage.token == nil {
             queuedMessages.insert(activeMessage, at: 0)
-            self.activeMessage = nil
         }
+        activeMessage = nil
         writeInProgress = false
         pendingChunks.removeAll()
         report(error.map { "disconnected:" + oneLine($0.localizedDescription) }
@@ -656,18 +752,9 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
             return
         }
         if characteristic.uuid == microphoneUUID {
-            microphoneBuffer.append(value)
-            while microphoneBuffer.count >= microphoneMuLawFrameBytes {
-                let encoded = microphoneBuffer.subdata(
-                    in: 0..<microphoneMuLawFrameBytes
-                )
-                microphoneBuffer.removeSubrange(0..<microphoneMuLawFrameBytes)
+            for encoded in microphoneTransport.receive(value) {
                 let pcm = muLawToLinearPCM(encoded)
                 emit("MIC " + pcm.base64EncodedString())
-            }
-            if microphoneBuffer.count > microphoneMuLawFrameBytes * 4 {
-                microphoneBuffer.removeAll(keepingCapacity: true)
-                report("microphone-overrun", repeatable: true)
             }
             return
         }

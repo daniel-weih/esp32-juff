@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "ble_manager.h"
+#include "battery_monitor.h"
 #include "device_client.h"
 
 #define ESP_OK 0
@@ -18,6 +19,7 @@
 #define portEXIT_CRITICAL(lock) ((void)0)
 #define pdMS_TO_TICKS(ms) (ms)
 #define pdTRUE 1
+#define portMAX_DELAY UINT32_MAX
 #define ESP_LOGI(...) ((void)0)
 #define ESP_LOGW(...) ((void)0)
 #define ESP_LOGE(...) ((void)0)
@@ -34,9 +36,10 @@ static const char *notice_title;
 
 static bool s_notify_enabled, s_advertising, s_microphone_notify_enabled;
 static bool s_voice_ready, s_input_suspended, s_playback_suspended;
-static bool s_speaker_response_active;
-static size_t s_speaker_length;
+static uint32_t s_microphone_generation;
 static void *s_speaker_mutex = (void *)1;
+static char s_flow_response[64];
+static uint8_t s_phy_tx = 2, s_phy_rx = 2;
 static uint16_t s_connection_handle = BLE_HS_CONN_HANDLE_NONE;
 static const char *s_device_name = "JUFF-test";
 
@@ -46,16 +49,19 @@ static const esp_app_desc_t *esp_app_get_description(void)
     static const esp_app_desc_t description = { .version = "0.6.0" };
     return &description;
 }
+battery_status_t battery_monitor_get(void)
+{
+    return (battery_status_t){ .supported = true, .valid = true,
+                               .percent = 40, .millivolts = 3790 };
+}
 static bool audio_io_is_playing(void) { return playing; }
 static bool audio_io_is_available(void) { return true; }
 static bool audio_io_supports_voice_barge_in(void) { return true; }
 static void audio_io_set_capture_enabled(bool value) { capture_enabled = value; }
 static void audio_io_clear(const char *reason) { playing = false; }
-static int audio_io_begin_response(const char *id, uint32_t rate)
-{ playing = true; return ESP_OK; }
-static int audio_io_end_response(const char *id) { return ESP_OK; }
-static void reset_speaker_stream(void) { s_speaker_response_active = false; }
-static void flush_speaker_locked(bool final) { (void)final; }
+static void reset_speaker_stream(void) {}
+static void mark_speaker_terminal(const char *id, const char *state) {}
+static void notify_speaker_credit(void) {}
 static int xSemaphoreTake(void *mutex, unsigned timeout) { return pdTRUE; }
 static void xSemaphoreGive(void *mutex) { (void)mutex; }
 static void board_display_set_voice_state(const char *state)
@@ -67,6 +73,16 @@ static void board_display_set_notice(const char *title, const char *detail, uint
 { notice_title = title; }
 static void board_display_cycle_brightness(void) {}
 static void board_display_start_audio_test(void) {}
+static int begin_ble_speaker(const char *id, uint32_t rate, uint32_t version, uint32_t stream)
+{
+    snprintf(s_flow_response, sizeof(s_flow_response), "%s", id);
+    playing = true;
+    s_playback_suspended = true;
+    board_display_set_voice_state("speaking");
+    capture_enabled = false;
+    return ESP_OK;
+}
+static int end_ble_speaker(const char *id, uint32_t stream) { return ESP_OK; }
 static bool wifi_manager_has_credentials(void) { return false; }
 static bool wifi_manager_is_connected(void) { return device_client_is_connected(); }
 static int wifi_manager_save_credentials(const char *ssid, const char *password)
@@ -135,6 +151,7 @@ static void reset(void)
     playing = capture_enabled = false;
     ble_interrupts = wifi_interrupts = wifi_pcm_attempts = ble_pcm_attempts = 0;
     s_voice_visual_state = VOICE_VISUAL_IDLE;
+    s_shutdown_state = DISPLAY_RUNNING;
     notice_title = "";
 }
 
@@ -154,6 +171,21 @@ int main(void)
 {
     lv_event_t clicked = LV_EVENT_CLICKED;
     char status[512];
+
+    // PWR shutdown owns the screen: queued touch events cannot trigger a
+    // voice command, and a repeated prepare cannot undo the powered-off latch.
+    reset();
+    start_ble_playback();
+    const char *pre_shutdown_notice = notice_title;
+    board_display_prepare_shutdown();
+    primary_clicked(&clicked);
+    assert(ble_interrupts == 0 && wifi_interrupts == 0 && playing);
+    assert(notice_title == pre_shutdown_notice);
+    s_shutdown_state = DISPLAY_POWERED_OFF;
+    board_display_prepare_shutdown();
+    assert(display_shutdown_state() == DISPLAY_POWERED_OFF);
+    primary_clicked(&clicked);
+    assert(ble_interrupts == 0 && wifi_interrupts == 0 && playing);
 
     // Touch, BOOT and the BLE control command must stay on BLE during playback.
     for (unsigned entry = 0; entry < 3; ++entry) {
@@ -177,6 +209,8 @@ int main(void)
     assert(strstr(status, "\"firmware\":\"0.6.0\"") != NULL);
     assert(strstr(status, "\"board\":\"waveshare-lcd-1.54\"") != NULL);
     assert(strstr(status, "\"voiceInterrupt\":true") != NULL);
+    assert(strstr(status, "\"battery\":{\"valid\":true,\"charging\":false,"
+                          "\"percent\":40,\"millivolts\":3790}") != NULL);
     wifi_connected = wifi_voice_active = true;
     const uint8_t pcm[] = { 0, 0 };
     microphone_pcm(pcm, sizeof(pcm), NULL);
@@ -185,11 +219,28 @@ int main(void)
     // Resume cannot enable the microphone until speaker playback has stopped.
     reset();
     start_ble_playback();
+    uint32_t microphone_generation = s_microphone_generation;
     command("input.suspend", NULL);
+    assert(s_microphone_generation != microphone_generation);
+    microphone_generation = s_microphone_generation;
     command("input.resume", NULL);
+    assert(s_microphone_generation == microphone_generation);
     assert(!ble_manager_is_voice_ready() && !capture_enabled);
-    ble_manager_send_playback_event("playback.ended", "response");
+    ble_manager_send_playback_event("playback.ended", "old-response");
+    assert(!ble_manager_is_voice_ready() && !capture_enabled);
+    ble_manager_send_playback_event("playback.ended", "ble-response");
+    assert(!ble_manager_is_voice_ready() && !capture_enabled);
+    playing = false;
+    ble_manager_send_playback_event("playback.ended", "ble-response");
     assert(ble_manager_is_voice_ready() && capture_enabled);
+    // Restoring capture after playback must retain the generation used by the
+    // frontend's immediately queued speech history.
+    assert(s_microphone_generation == microphone_generation);
+    command("voice.deactivated", NULL);
+    assert(s_microphone_generation != microphone_generation);
+    microphone_generation = s_microphone_generation;
+    command("voice.ready", NULL);
+    assert(s_microphone_generation != microphone_generation);
 
     // Manual stop works during an external suspension, but cannot revoke it.
     for (unsigned finish = 0; finish < 3; ++finish) {
@@ -200,7 +251,10 @@ int main(void)
         assert(ble_interrupts == 0 && playing);
         if (finish == 0) primary_clicked(&clicked);
         if (finish == 1) command("playback.clear", NULL);
-        if (finish == 2) ble_manager_send_playback_event("playback.cancelled", "response");
+        if (finish == 2) {
+            playing = false;
+            ble_manager_send_playback_event("playback.cancelled", "ble-response");
+        }
         assert(ble_manager_is_voice_active());
         assert(!ble_manager_is_voice_ready() && !capture_enabled);
         command("input.resume", NULL);

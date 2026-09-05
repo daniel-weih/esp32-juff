@@ -1,6 +1,8 @@
 #include "board_display.h"
 #include "board_config.h"
 #include "companion_face.h"
+#include "battery_indicator.h"
+#include "battery_monitor.h"
 
 #include <inttypes.h>
 #include <limits.h>
@@ -56,6 +58,12 @@ typedef enum {
     VOICE_VISUAL_SPEAKING,
 } voice_visual_state_t;
 
+typedef enum {
+    DISPLAY_RUNNING,
+    DISPLAY_PREPARING_SHUTDOWN,
+    DISPLAY_POWERED_OFF,
+} display_shutdown_state_t;
+
 static const char *TAG = "juff_display";
 static esp_lcd_panel_io_handle_t s_lcd_io;
 static i2c_master_dev_handle_t s_touch;
@@ -64,6 +72,9 @@ static lv_disp_drv_t s_display_driver;
 static lv_indev_drv_t s_touch_driver;
 static esp_timer_handle_t s_tick_timer;
 static SemaphoreHandle_t s_state_mutex;
+static portMUX_TYPE s_shutdown_lock = portMUX_INITIALIZER_UNLOCKED;
+static display_shutdown_state_t s_shutdown_state;
+static bool s_backlight_initialized;
 static volatile bool s_flush_pending;
 static volatile uint32_t s_completed_flushes;
 static bool s_ready;
@@ -78,6 +89,7 @@ static uint64_t s_notice_until_ms;
 
 static lv_obj_t *s_connection_pill;
 static lv_obj_t *s_connection_label;
+static lv_obj_t *s_battery_indicator;
 static lv_obj_t *s_face;
 static lv_obj_t *s_status_dot;
 static lv_obj_t *s_main_title;
@@ -147,11 +159,36 @@ static uint64_t uptime_ms(void)
     return (uint64_t)(esp_timer_get_time() / 1000);
 }
 
+static display_shutdown_state_t display_shutdown_state(void)
+{
+    portENTER_CRITICAL(&s_shutdown_lock);
+    const display_shutdown_state_t state = s_shutdown_state;
+    portEXIT_CRITICAL(&s_shutdown_lock);
+    return state;
+}
+
 static esp_err_t set_brightness(uint8_t percent)
 {
     if (percent > 100) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (s_state_mutex == NULL) {
+        return percent == 0 ? ESP_OK : ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (!s_backlight_initialized
+        || (percent != 0 && display_shutdown_state() != DISPLAY_RUNNING)) {
+        xSemaphoreGive(s_state_mutex);
+        return percent == 0 ? ESP_OK : ESP_ERR_INVALID_STATE;
+    }
+    if (percent == 0 && s_brightness == 0) {
+        xSemaphoreGive(s_state_mutex);
+        return ESP_OK;
+    }
+    // Serialize the complete duty update with power-off, including a brightness
+    // request that was already in flight when shutdown was latched.
     const uint32_t duty = ((uint32_t)percent * 1023U) / 100U;
     esp_err_t error = ledc_set_duty(LEDC_LOW_SPEED_MODE,
                                     LEDC_CHANNEL_0,
@@ -161,8 +198,9 @@ static esp_err_t set_brightness(uint8_t percent)
     }
     if (error == ESP_OK) {
         s_brightness = percent;
-        ESP_LOGI(TAG, "Backlight brightness=%u%%", percent);
     }
+    xSemaphoreGive(s_state_mutex);
+    if (error == ESP_OK) ESP_LOGI(TAG, "Backlight brightness=%u%%", percent);
     return error;
 }
 
@@ -175,7 +213,6 @@ static esp_err_t initialize_backlight(void)
         .freq_hz = 5000,
         .clk_cfg = LEDC_AUTO_CLK,
     };
-    ESP_RETURN_ON_ERROR(ledc_timer_config(&timer), TAG, "backlight timer");
     const ledc_channel_config_t channel = {
         .gpio_num = LCD_PIN_BACKLIGHT,
         .speed_mode = LEDC_LOW_SPEED_MODE,
@@ -185,7 +222,18 @@ static esp_err_t initialize_backlight(void)
         .duty = 0,
         .hpoint = 0,
     };
-    return ledc_channel_config(&channel);
+    if (s_state_mutex == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t error = ESP_ERR_INVALID_STATE;
+    if (display_shutdown_state() == DISPLAY_RUNNING) {
+        error = ledc_timer_config(&timer);
+        if (error == ESP_OK) error = ledc_channel_config(&channel);
+        s_backlight_initialized = error == ESP_OK;
+    }
+    xSemaphoreGive(s_state_mutex);
+    return error;
 }
 
 static esp_err_t lcd_command(uint8_t command,
@@ -428,6 +476,10 @@ static esp_err_t touch_read(uint8_t first_register,
 static void touch_read_callback(lv_indev_drv_t *driver, lv_indev_data_t *data)
 {
     (void)driver;
+    if (display_shutdown_state() != DISPLAY_RUNNING) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
     uint8_t touch_data[5] = { 0 };
     const esp_err_t error = touch_read(0x02,
                                        touch_data,
@@ -579,6 +631,24 @@ static void snapshot_ui_state(char title[40],
 
 static void refresh_status_ui(void)
 {
+    const display_shutdown_state_t shutdown = display_shutdown_state();
+    if (shutdown != DISPLAY_RUNNING) {
+        if (shutdown == DISPLAY_POWERED_OFF) return;
+        // LVGL objects remain owned by this task. Hide any pairing sheet so
+        // that holding PWR always reveals the release-to-shut-down message.
+        lv_obj_add_flag(s_connection_overlay, LV_OBJ_FLAG_HIDDEN);
+        set_label_text(s_main_title, "good night.");
+        set_label_text(s_main_detail, "Release to power off");
+        set_label_text(s_primary_button_label, "sweet dreams");
+        lv_obj_add_state(s_primary_button, LV_STATE_DISABLED);
+        companion_face_set(s_face, COMPANION_MOOD_DOZING, s_animation_phase++);
+        return;
+    }
+    if (s_battery_indicator != NULL) {
+        const battery_status_t battery = battery_monitor_get();
+        battery_indicator_set(s_battery_indicator, battery.valid,
+                              battery.percent, battery.charging);
+    }
     const bool wifi_connected = wifi_manager_is_connected();
     const bool ble_connected = ble_manager_is_connected();
     const bool ble_advertising = ble_manager_is_advertising();
@@ -727,7 +797,7 @@ static void audio_test_task(void *argument)
 
 void board_display_start_audio_test(void)
 {
-    if (s_state_mutex == NULL) {
+    if (display_shutdown_state() != DISPLAY_RUNNING || s_state_mutex == NULL) {
         return;
     }
     if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
@@ -761,7 +831,8 @@ void board_display_start_audio_test(void)
 
 static void primary_clicked(lv_event_t *event)
 {
-    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+    if (display_shutdown_state() != DISPLAY_RUNNING
+        || lv_event_get_code(event) != LV_EVENT_CLICKED) {
         return;
     }
 
@@ -801,6 +872,7 @@ static void primary_clicked(lv_event_t *event)
 
 void board_display_cycle_brightness(void)
 {
+    if (display_shutdown_state() != DISPLAY_RUNNING) return;
     uint8_t next = 100;
     if (s_brightness > 80) {
         next = 65;
@@ -823,7 +895,8 @@ static void brightness_clicked(lv_event_t *event)
 
 static void connection_pill_clicked(lv_event_t *event)
 {
-    if (lv_event_get_code(event) != LV_EVENT_CLICKED
+    if (display_shutdown_state() != DISPLAY_RUNNING
+        || lv_event_get_code(event) != LV_EVENT_CLICKED
         || s_connection_overlay == NULL) {
         return;
     }
@@ -835,7 +908,8 @@ static void connection_pill_clicked(lv_event_t *event)
 
 static void connection_close_clicked(lv_event_t *event)
 {
-    if (lv_event_get_code(event) == LV_EVENT_CLICKED
+    if (display_shutdown_state() == DISPLAY_RUNNING
+        && lv_event_get_code(event) == LV_EVENT_CLICKED
         && s_connection_overlay != NULL) {
         lv_obj_add_flag(s_connection_overlay, LV_OBJ_FLAG_HIDDEN);
     }
@@ -843,7 +917,8 @@ static void connection_close_clicked(lv_event_t *event)
 
 static void pairing_clicked(lv_event_t *event)
 {
-    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+    if (display_shutdown_state() != DISPLAY_RUNNING
+        || lv_event_get_code(event) != LV_EVENT_CLICKED) {
         return;
     }
     if (ble_manager_is_pairing()) {
@@ -896,7 +971,8 @@ static void place(lv_obj_t *object, int x, int y, int width, int height)
 
 static void main_action_clicked(lv_event_t *event)
 {
-    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    if (display_shutdown_state() != DISPLAY_RUNNING
+        || lv_event_get_code(event) != LV_EVENT_CLICKED) return;
     voice_visual_state_t state = VOICE_VISUAL_IDLE;
     char title[40], detail[96];
     bool testing;
@@ -926,11 +1002,18 @@ static void create_ui(void)
     style_panel(s_status_dot, COLOR_PRIMARY_DEEP, LV_RADIUS_CIRCLE);
     place(s_status_dot, margin, header_y + 14, 5, 5);
 
-    s_connection_pill = create_button(screen, LCD_WIDTH - margin - 40, header_y,
+    const bool show_battery = battery_monitor_get().supported;
+    s_connection_pill = create_button(screen, LCD_WIDTH - margin - 40 - (show_battery ? 60 : 0), header_y,
                                       40, 34, "", COLOR_SURFACE, connection_pill_clicked);
     s_connection_label = make_label(s_connection_pill, LV_SYMBOL_BLUETOOTH,
                                     &lv_font_montserrat_16, COLOR_TEXT);
     lv_obj_center(s_connection_label);
+    if (show_battery) {
+        s_battery_indicator = battery_indicator_create(screen);
+        if (s_battery_indicator != NULL) {
+            place(s_battery_indicator, LCD_WIDTH - margin - 48, header_y + 6, 48, 22);
+        }
+    }
 
     s_face = companion_face_create(screen);
     place(s_face, UI_COMPACT ? 10 : 20, UI_COMPACT ? 44 : 82,
@@ -1028,6 +1111,13 @@ static void lvgl_task(void *argument)
     uint64_t next_status_refresh = 0;
     bool first_frame_reported = false;
     while (true) {
+        if (display_shutdown_state() == DISPLAY_POWERED_OFF) {
+            // Retry a power-off that raced a busy state lock. Stop servicing
+            // LVGL while the power manager finishes shutting the device down.
+            (void)set_brightness(0);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         if (!first_frame_reported && s_completed_flushes > 0) {
             first_frame_reported = true;
             ESP_LOGI(TAG,
@@ -1050,6 +1140,7 @@ static void lvgl_task(void *argument)
 
 esp_err_t board_display_init(void)
 {
+    if (display_shutdown_state() != DISPLAY_RUNNING) return ESP_ERR_INVALID_STATE;
     if (s_ready) {
         return ESP_OK;
     }
@@ -1127,6 +1218,23 @@ esp_err_t board_display_init(void)
 bool board_display_is_ready(void)
 {
     return s_ready;
+}
+
+void board_display_prepare_shutdown(void)
+{
+    portENTER_CRITICAL(&s_shutdown_lock);
+    if (s_shutdown_state == DISPLAY_RUNNING) {
+        s_shutdown_state = DISPLAY_PREPARING_SHUTDOWN;
+    }
+    portEXIT_CRITICAL(&s_shutdown_lock);
+}
+
+esp_err_t board_display_power_off(void)
+{
+    portENTER_CRITICAL(&s_shutdown_lock);
+    s_shutdown_state = DISPLAY_POWERED_OFF;
+    portEXIT_CRITICAL(&s_shutdown_lock);
+    return set_brightness(0);
 }
 
 void board_display_set_voice_state(const char *state)

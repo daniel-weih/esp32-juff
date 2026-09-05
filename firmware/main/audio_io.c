@@ -36,6 +36,16 @@ static const char *TAG = "juff_audio";
 #define GATEWAY_FRAME_SAMPLES 1600
 #define RESPONSE_ID_SIZE 64
 #define PLAYBACK_QUEUE_DEPTH 80
+#define PLAYBACK_BUFFER_CAPACITY_BYTES 192000U
+#define PLAYBACK_PREFILL_BYTES 14400U
+#define PLAYBACK_REFILL_BYTES 12000U
+#define PLAYBACK_BUFFER_WAIT_MS 600U
+#define PLAYBACK_POLL_MS 10U
+#define CODEC_DMA_DESCRIPTORS 6U
+#define CODEC_DMA_FRAMES 240U
+// Conservative drain allowance: a full DMA ring plus one descriptor. This is
+// a configured upper-bound estimate, not a hardware playback-complete event.
+#define CODEC_DRAIN_US ((CODEC_DMA_DESCRIPTORS + 1U) * CODEC_DMA_FRAMES * 1000000LL / CODEC_SAMPLE_RATE)
 #define DIAGNOSTIC_WARMUP_MS 500
 #define DIAGNOSTIC_AMBIENT_MS 400
 #define DIAGNOSTIC_TONE_CHUNKS 4
@@ -63,6 +73,8 @@ typedef struct {
     uint32_t sample_rate;
     uint8_t *data;
     size_t size;
+    uint32_t generation;
+    bool reserved;
 } audio_item_t;
 
 typedef struct {
@@ -81,7 +93,20 @@ static esp_codec_dev_handle_t s_input_codec;
 static SemaphoreHandle_t s_codec_write_mutex;
 static portMUX_TYPE s_codec_write_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_codec_write_generation;
+static uint32_t s_buffered_bytes;
+static uint32_t s_response_bytes;
+static uint32_t s_playback_underruns;
+static bool s_buffering;
+static bool s_response_open;
+static bool s_response_ended;
+static char s_response_id[RESPONSE_ID_SIZE];
+// Control mailboxes cannot be blocked by a full PCM queue. A busy BEGIN is
+// rejected before changing the current generation or interrupting its audio.
+static audio_item_t s_pending_begin;
+static bool s_begin_pending;
+static bool s_clear_pending;
 static bool s_self_test_running;
+static volatile bool s_shutdown_requested;
 static QueueHandle_t s_playback_queue;
 static audio_pcm_callback_t s_pcm_callback;
 static audio_playback_callback_t s_playback_callback;
@@ -96,7 +121,23 @@ static portMUX_TYPE s_diagnostic_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool s_diagnostic_collecting;
 static microphone_stats_t s_diagnostic_stats;
 static bool s_voice_frontend_ready;
+static audio_barge_in_callback_t s_barge_in_callback;
 static audio_barge_in_callback_t s_barge_in_allowed_callback;
+
+static void deliver_captured_pcm(const uint8_t *data, size_t size, void *context)
+{
+    if (!s_shutdown_requested && s_pcm_callback != NULL) {
+        s_pcm_callback(data, size, context);
+    }
+}
+
+#if CONFIG_JUFF_VOICE_BARGE_IN
+static bool request_voice_interrupt(void *context)
+{
+    return !s_shutdown_requested && s_barge_in_callback != NULL
+        && s_barge_in_callback(context);
+}
+#endif
 #if CONFIG_JUFF_VOICE_BARGE_IN
 static portMUX_TYPE s_frontend_playback_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_frontend_playback_generation;
@@ -185,11 +226,21 @@ static void free_item(audio_item_t *item)
 {
     free(item->data);
     item->data = NULL;
+    if (item->reserved) {
+        portENTER_CRITICAL(&s_codec_write_lock);
+        s_buffered_bytes -= item->size;
+        if (item->generation == s_codec_write_generation) s_response_bytes -= item->size;
+        portEXIT_CRITICAL(&s_codec_write_lock);
+        item->reserved = false;
+    }
 }
 
 static esp_err_t enqueue_item(audio_item_t *item)
 {
-    if (s_playback_queue == NULL) {
+    portENTER_CRITICAL(&s_codec_write_lock);
+    const bool stale = item->generation != s_codec_write_generation;
+    portEXIT_CRITICAL(&s_codec_write_lock);
+    if (s_playback_queue == NULL || s_shutdown_requested || stale) {
         free_item(item);
         return ESP_ERR_INVALID_STATE;
     }
@@ -203,7 +254,8 @@ static esp_err_t enqueue_item(audio_item_t *item)
         free_item(item);
         return ESP_ERR_NO_MEM;
     }
-    return ESP_OK;
+    // The queue owns the item even if shutdown raced the blocking send.
+    return s_shutdown_requested ? ESP_ERR_INVALID_STATE : ESP_OK;
 }
 
 static esp_err_t codec_status(int result, const char *operation)
@@ -223,10 +275,21 @@ static uint32_t codec_write_generation(void)
     return generation;
 }
 
+static void cancel_playback_state_locked(void)
+{
+    ++s_codec_write_generation;
+    s_response_open = false;
+    s_response_ended = false;
+    s_response_bytes = 0;
+    s_buffering = false;
+    s_playing = false;
+    s_clear_pending = true;
+}
+
 static void cancel_codec_writes(void)
 {
     portENTER_CRITICAL(&s_codec_write_lock);
-    ++s_codec_write_generation;
+    cancel_playback_state_locked();
     portEXIT_CRITICAL(&s_codec_write_lock);
 }
 
@@ -254,16 +317,19 @@ static esp_err_t expander_write_register(uint8_t reg, uint8_t value)
 static esp_err_t set_amplifier_enabled(bool enabled)
 {
 #if CONFIG_JUFF_CODEC_PA_GPIO >= 0
-    const esp_err_t error = gpio_set_level(CONFIG_JUFF_CODEC_PA_GPIO, enabled);
+    // A direct GPIO write cannot block. Serialize its enable decision with
+    // shutdown so an already-running BEGIN cannot reopen the PA afterward.
+    portENTER_CRITICAL(&s_codec_write_lock);
+    const esp_err_t error = enabled && s_shutdown_requested ? ESP_ERR_INVALID_STATE
+        : gpio_set_level(CONFIG_JUFF_CODEC_PA_GPIO, enabled);
+    if (error == ESP_OK) s_amplifier_enabled = enabled;
+    portEXIT_CRITICAL(&s_codec_write_lock);
+    return error;
 #else
-    const esp_err_t error = audio_io_set_expander_pin(
+    return audio_io_set_expander_pin(
         CONFIG_JUFF_CODEC_PA_EXPANDER_PIN,
         enabled);
 #endif
-    if (error == ESP_OK) {
-        s_amplifier_enabled = enabled;
-    }
-    return error;
 }
 
 esp_err_t audio_io_set_expander_pin(unsigned pin, bool high)
@@ -273,6 +339,10 @@ esp_err_t audio_io_set_expander_pin(unsigned pin, bool high)
     }
     if (xSemaphoreTake(s_io_expander_mutex, pdMS_TO_TICKS(250)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
+    }
+    if (pin == CONFIG_JUFF_CODEC_PA_EXPANDER_PIN && high && s_shutdown_requested) {
+        xSemaphoreGive(s_io_expander_mutex);
+        return ESP_ERR_INVALID_STATE;
     }
 
     const uint8_t bit = (uint8_t)(1U << pin);
@@ -294,6 +364,9 @@ esp_err_t audio_io_set_expander_pin(unsigned pin, bool high)
         if (error == ESP_OK) {
             s_io_expander_configuration = next_configuration;
         }
+    }
+    if (error == ESP_OK && pin == CONFIG_JUFF_CODEC_PA_EXPANDER_PIN) {
+        s_amplifier_enabled = high;
     }
     xSemaphoreGive(s_io_expander_mutex);
     return error;
@@ -357,6 +430,8 @@ static esp_err_t initialize_i2s(const audio_codec_data_if_t **data_interface)
         CONFIG_JUFF_CODEC_I2S_PORT,
         I2S_ROLE_MASTER);
     channel_config.auto_clear = true;
+    channel_config.dma_desc_num = CODEC_DMA_DESCRIPTORS;
+    channel_config.dma_frame_num = CODEC_DMA_FRAMES;
     esp_err_t error = i2s_new_channel(&channel_config, &s_tx_channel, &s_rx_channel);
     if (error != ESP_OK) {
         return error;
@@ -674,7 +749,7 @@ static int write_i2s_bytes(void *context, const void *data, size_t size, size_t 
 {
     const codec_write_context_t *write = context;
     *written = 0;
-    if (write->generation != codec_write_generation()) return ESP_ERR_INVALID_STATE;
+    if (s_shutdown_requested || write->generation != codec_write_generation()) return ESP_ERR_INVALID_STATE;
     if (esp_timer_get_time() >= write->deadline_us) return ESP_ERR_TIMEOUT;
     const esp_err_t error = i2s_channel_write(s_tx_channel, data, size, written,
                                              CODEC_WRITE_WAIT_MS);
@@ -694,7 +769,7 @@ static esp_err_t write_codec_pcm_mono(const void *pcm, size_t size, uint32_t gen
 {
     if (pcm == NULL || size == 0 || size % sizeof(int16_t) != 0) return ESP_ERR_INVALID_ARG;
     if (s_tx_channel == NULL || s_codec_write_mutex == NULL) return ESP_ERR_INVALID_STATE;
-    if (generation != codec_write_generation()) return ESP_ERR_INVALID_STATE;
+    if (s_shutdown_requested || generation != codec_write_generation()) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_codec_write_mutex, pdMS_TO_TICKS(CODEC_WRITE_WAIT_MS)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
@@ -840,13 +915,14 @@ static void capture_task(void *argument)
 #if CONFIG_JUFF_VOICE_BARGE_IN
     uint32_t seen_rx_overflows = 0;
 #endif
-    while (true) {
+    while (!s_shutdown_requested) {
 #if CONFIG_JUFF_VOICE_BARGE_IN
         const voice_frontend_playback_t before_read = snapshot_frontend_playback();
 #endif
         const int result = esp_codec_dev_read(s_input_codec,
                                               codec_pcm,
                                               CAPTURE_FRAMES * CAPTURE_CHANNELS * sizeof(*codec_pcm));
+        if (s_shutdown_requested) break;
         if (result != ESP_CODEC_DEV_OK) {
             ESP_LOGW(TAG, "Microphone read failed (codec status=%d)", result);
 #if CONFIG_JUFF_VOICE_BARGE_IN
@@ -882,7 +958,7 @@ static void capture_task(void *argument)
                 gateway_pcm[index] = (doubled & 1U) == 0 ? codec_pcm[source]
                     : (int16_t)(((int32_t)codec_pcm[source] + codec_pcm[source + CAPTURE_CHANNELS]) / 2);
             }
-            s_pcm_callback((const uint8_t *)gateway_pcm,
+            deliver_captured_pcm((const uint8_t *)gateway_pcm,
                            CAPTURE_FRAMES * 2 / 3 * sizeof(*gateway_pcm), s_callback_context);
         }
 #else
@@ -892,11 +968,20 @@ static void capture_task(void *argument)
         }
 
         resample_24k_to_16k(codec_pcm, gateway_pcm);
-        s_pcm_callback((const uint8_t *)gateway_pcm,
+        deliver_captured_pcm((const uint8_t *)gateway_pcm,
                        GATEWAY_FRAME_SAMPLES * sizeof(*gateway_pcm),
                        s_callback_context);
 #endif
     }
+    // Finish on the capture task: the DSP state is never reset concurrently
+    // with processing. No further reads or uploads occur after this point.
+#if CONFIG_JUFF_VOICE_BARGE_IN
+    if (s_voice_frontend_ready) voice_frontend_reset_stream();
+#endif
+    ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_disable(s_rx_channel));
+    free(codec_pcm);
+    free(gateway_pcm);
+    vTaskDelete(NULL);
 }
 
 static void notify_playback(const char *event_type, const char *response_id)
@@ -906,104 +991,199 @@ static void notify_playback(const char *event_type, const char *response_id)
     }
 }
 
+static bool playback_generation_current(uint32_t generation)
+{
+    return !s_shutdown_requested && generation == codec_write_generation();
+}
+
+static void set_playback_buffering(uint32_t generation, bool buffering)
+{
+    portENTER_CRITICAL(&s_codec_write_lock);
+    if (generation == s_codec_write_generation) s_buffering = buffering;
+    portEXIT_CRITICAL(&s_codec_write_lock);
+}
+
+static bool wait_for_playback_buffer(uint32_t generation, uint32_t target)
+{
+    const int64_t deadline = esp_timer_get_time() + PLAYBACK_BUFFER_WAIT_MS * 1000LL;
+    while (playback_generation_current(generation)) {
+        portENTER_CRITICAL(&s_codec_write_lock);
+        const bool ready = s_response_bytes >= target || s_response_ended;
+        portEXIT_CRITICAL(&s_codec_write_lock);
+        // A slow live source gets a bounded first-audio delay. The deadline
+        // starts with the first PCM, not while waiting for speech synthesis.
+        if (ready || esp_timer_get_time() >= deadline) return true;
+        vTaskDelay(pdMS_TO_TICKS(PLAYBACK_POLL_MS));
+    }
+    return false;
+}
+
+static void stop_playback_output(bool reset)
+{
+    ESP_ERROR_CHECK_WITHOUT_ABORT(set_amplifier_enabled(false));
+    (void)esp_codec_dev_set_out_mute(s_codec, true);
+    if (reset && !s_shutdown_requested
+        && xSemaphoreTake(s_codec_write_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(reset_codec_tx_locked());
+        xSemaphoreGive(s_codec_write_mutex);
+    }
+}
+
+static void finish_playback_state(uint32_t generation)
+{
+    portENTER_CRITICAL(&s_codec_write_lock);
+    if (generation == s_codec_write_generation) {
+        s_playing = false;
+        s_buffering = false;
+        s_response_open = false;
+    }
+    portEXIT_CRITICAL(&s_codec_write_lock);
+}
+
+static void clear_failed_playback(uint32_t generation)
+{
+    portENTER_CRITICAL(&s_codec_write_lock);
+    const bool current = !s_shutdown_requested && generation == s_codec_write_generation;
+    if (current) cancel_playback_state_locked();
+    portEXIT_CRITICAL(&s_codec_write_lock);
+    // Checking and cancelling are one transaction: an old writer error must
+    // not clear a new BEGIN committed while the error was being reported.
+    if (current) ESP_ERROR_CHECK_WITHOUT_ABORT(set_amplifier_enabled(false));
+}
+
 static void playback_task(void *argument)
 {
     (void)argument;
     char current_response[RESPONSE_ID_SIZE] = { 0 };
+    bool active = false;
     bool started = false;
+    bool needs_buffer = true;
     uint32_t write_generation = codec_write_generation();
+    int64_t last_write_us = 0;
 
     while (true) {
+        audio_item_t begin = { 0 };
+        portENTER_CRITICAL(&s_codec_write_lock);
+        const bool have_begin = s_begin_pending;
+        if (have_begin) {
+            begin = s_pending_begin;
+            s_begin_pending = false;
+        }
+        const bool clear = s_clear_pending;
+        s_clear_pending = false;
+        portEXIT_CRITICAL(&s_codec_write_lock);
+
+        bool stopped = false;
+        if (active && !playback_generation_current(write_generation)) {
+            stop_playback_output(true);
+            stopped = true;
+            finish_playback_state(write_generation);
+            notify_playback("playback.cancelled", current_response);
+            active = false;
+            started = false;
+        }
+        if (clear && !stopped) stop_playback_output(true);
+        if (have_begin) {
+            if (!playback_generation_current(begin.generation)) {
+                finish_playback_state(begin.generation);
+                notify_playback("playback.cancelled", begin.response_id);
+            } else {
+                // Natural END already drained DMA. Keep the shared TX/RX
+                // clocks running between responses; cancellation resets above.
+                // PA stays off during prefill and AEC warmup starts at first PCM.
+                if (!stopped && !clear) stop_playback_output(false);
+                copy_response_id(current_response, begin.response_id);
+                write_generation = begin.generation;
+                active = true;
+                started = false;
+                needs_buffer = true;
+                last_write_us = 0;
+#if CONFIG_JUFF_VOICE_BARGE_IN
+                begin_frontend_playback();
+#endif
+                if (begin.sample_rate != CODEC_SAMPLE_RATE) {
+                    ESP_LOGW(TAG, "Gateway output is %" PRIu32 " Hz; ES8311 remains at %d Hz",
+                             begin.sample_rate, CODEC_SAMPLE_RATE);
+                }
+            }
+        }
+
         audio_item_t item = { 0 };
-        if (xQueueReceive(s_playback_queue, &item, portMAX_DELAY) != pdTRUE) {
+        if (xQueueReceive(s_playback_queue, &item, 0) == pdTRUE) {
+            if (!active || item.generation != write_generation
+                || !playback_generation_current(write_generation)) {
+                free_item(&item);
+                continue;
+            }
+            if (needs_buffer && !wait_for_playback_buffer(write_generation,
+                    started ? PLAYBACK_REFILL_BYTES : PLAYBACK_PREFILL_BYTES)) {
+                free_item(&item);
+                continue;
+            }
+            if (!playback_generation_current(write_generation)) {
+                free_item(&item);
+                continue;
+            }
+            needs_buffer = false;
+            set_playback_buffering(write_generation, false);
+            if (!started) {
+                notify_playback("playback.started", current_response);
+                if (!playback_generation_current(write_generation)) {
+                    free_item(&item);
+                    continue;
+                }
+                const esp_err_t amplifier_error = set_amplifier_enabled(true);
+                vTaskDelay(pdMS_TO_TICKS(PLAYBACK_POLL_MS));
+                if (amplifier_error != ESP_OK || !playback_generation_current(write_generation)) {
+                    ESP_ERROR_CHECK_WITHOUT_ABORT(set_amplifier_enabled(false));
+                    free_item(&item);
+                    clear_failed_playback(write_generation);
+                    continue;
+                }
+                (void)esp_codec_dev_set_out_mute(s_codec, false);
+#if CONFIG_JUFF_VOICE_BARGE_IN
+                // Notification and PA stabilization may wait. Publish only at
+                // the actual first write so neither consumes AEC warmup.
+                mark_frontend_pcm_started();
+#endif
+                started = true;
+            }
+            const esp_err_t result = write_codec_pcm_mono(item.data, item.size, write_generation);
+            last_write_us = esp_timer_get_time();
+            free_item(&item);
+            if (result != ESP_OK) {
+                ESP_LOGW(TAG, "Speaker write stopped: %s", esp_err_to_name(result));
+                clear_failed_playback(write_generation);
+            }
             continue;
         }
 
-        if (item.type == AUDIO_ITEM_BEGIN) {
+        if (active && playback_generation_current(write_generation)) {
             portENTER_CRITICAL(&s_codec_write_lock);
-            const bool diagnostic_running = s_self_test_running;
-            if (!diagnostic_running) s_playing = true;
+            const bool ended = s_response_ended;
+            const uint32_t remaining = s_response_bytes;
             portEXIT_CRITICAL(&s_codec_write_lock);
-            if (diagnostic_running) {
-                notify_playback("playback.cancelled", item.response_id);
-                free_item(&item);
-                continue;
-            }
-            if (started || current_response[0] != '\0') {
-                notify_playback("playback.cancelled", current_response);
-            }
-            copy_response_id(current_response, item.response_id);
-            started = false;
-            write_generation = codec_write_generation();
-#if CONFIG_JUFF_VOICE_BARGE_IN
-            begin_frontend_playback();
-#endif
-            ESP_ERROR_CHECK_WITHOUT_ABORT(set_amplifier_enabled(true));
-            vTaskDelay(pdMS_TO_TICKS(5));
-            (void)esp_codec_dev_set_out_mute(s_codec, false);
-            if (item.sample_rate != CODEC_SAMPLE_RATE) {
-                ESP_LOGW(TAG,
-                         "Gateway output is %" PRIu32 " Hz; ES8311 remains at %d Hz",
-                         item.sample_rate,
-                         CODEC_SAMPLE_RATE);
-            }
-        } else if (item.type == AUDIO_ITEM_PCM) {
-            if (current_response[0] == '\0') {
-                free_item(&item);
-                continue;
-            }
-            if (!started) {
-                started = true;
-                notify_playback("playback.started", current_response);
-#if CONFIG_JUFF_VOICE_BARGE_IN
-                // Notification delivery may wait; start AEC warmup only now,
-                // immediately before the first actual codec write.
-                mark_frontend_pcm_started();
-#endif
-            }
-            const esp_err_t result = write_codec_pcm_mono(item.data, item.size, write_generation);
-            if (result != ESP_OK) {
-                ESP_LOGW(TAG, "Speaker write stopped: %s", esp_err_to_name(result));
-                // An explicit Clear already queued cancellation. Repeating it
-                // here could discard a newer response queued in the meantime.
-                if (write_generation == codec_write_generation()) {
-                    audio_io_clear("speaker write stopped");
-                }
-            }
-        } else if (item.type == AUDIO_ITEM_END) {
-            // A BEGIN rejected during diagnostics has no playback to end.
-            // Likewise, a delayed END must not mute a newer response.
-            if (current_response[0] == '\0'
-                || (item.response_id[0] != '\0'
-                    && strcmp(item.response_id, current_response) != 0)) {
-                free_item(&item);
-                continue;
-            }
-            if (started) {
+            const bool drained = !started || esp_timer_get_time() - last_write_us >= CODEC_DRAIN_US;
+            if (ended && remaining == 0 && drained) {
+                stop_playback_output(false);
+                finish_playback_state(write_generation);
+                // Empty responses also need a terminal acknowledgement. The
+                // sender may not start its next response until this arrives.
                 notify_playback("playback.ended", current_response);
+                active = false;
+                started = false;
+            } else if (started && !needs_buffer && drained && (!ended || remaining != 0)) {
+                portENTER_CRITICAL(&s_codec_write_lock);
+                if (write_generation == s_codec_write_generation) {
+                    ++s_playback_underruns;
+                    s_buffering = true;
+                }
+                portEXIT_CRITICAL(&s_codec_write_lock);
+                needs_buffer = true;
+                ESP_LOGW(TAG, "Playback underrun; refilling audio buffer");
             }
-            (void)esp_codec_dev_set_out_mute(s_codec, true);
-            vTaskDelay(pdMS_TO_TICKS(2));
-            ESP_ERROR_CHECK_WITHOUT_ABORT(set_amplifier_enabled(false));
-            current_response[0] = '\0';
-            started = false;
-            s_playing = false;
-        } else if (item.type == AUDIO_ITEM_CLEAR) {
-            if (started || current_response[0] != '\0') {
-                notify_playback("playback.cancelled", current_response);
-            }
-            (void)esp_codec_dev_set_out_mute(s_codec, true);
-            vTaskDelay(pdMS_TO_TICKS(2));
-            ESP_ERROR_CHECK_WITHOUT_ABORT(set_amplifier_enabled(false));
-            current_response[0] = '\0';
-            started = false;
-            if (xSemaphoreTake(s_codec_write_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                ESP_ERROR_CHECK_WITHOUT_ABORT(reset_codec_tx_locked());
-                xSemaphoreGive(s_codec_write_mutex);
-            }
-            s_playing = false;
         }
-        free_item(&item);
+        vTaskDelay(pdMS_TO_TICKS(PLAYBACK_POLL_MS));
     }
 }
 
@@ -1013,8 +1193,10 @@ esp_err_t audio_io_init(audio_pcm_callback_t pcm_callback,
                         audio_barge_in_callback_t barge_in_allowed_callback,
                         void *context)
 {
+    if (s_shutdown_requested) return ESP_ERR_INVALID_STATE;
     s_pcm_callback = pcm_callback;
     s_playback_callback = playback_callback;
+    s_barge_in_callback = barge_in_callback;
     s_barge_in_allowed_callback = barge_in_allowed_callback;
     s_callback_context = context;
     s_playback_queue = xQueueCreate(PLAYBACK_QUEUE_DEPTH, sizeof(audio_item_t));
@@ -1034,7 +1216,7 @@ esp_err_t audio_io_init(audio_pcm_callback_t pcm_callback,
     }
 
 #if CONFIG_JUFF_VOICE_BARGE_IN
-    error = voice_frontend_init(pcm_callback, barge_in_callback, context);
+    error = voice_frontend_init(deliver_captured_pcm, request_voice_interrupt, context);
     s_voice_frontend_ready = error == ESP_OK;
     if (!s_voice_frontend_ready) {
         ESP_LOGE(TAG, "Voice interruption unavailable (%s); retaining half-duplex audio",
@@ -1077,7 +1259,7 @@ esp_err_t audio_io_run_self_test(void)
         return ESP_ERR_INVALID_STATE;
     }
     portENTER_CRITICAL(&s_codec_write_lock);
-    const bool busy = s_playing || s_self_test_running;
+    const bool busy = s_playing || s_self_test_running || s_shutdown_requested;
     if (!busy) s_self_test_running = true;
     portEXIT_CRITICAL(&s_codec_write_lock);
     if (busy) {
@@ -1105,7 +1287,9 @@ esp_err_t audio_io_run_self_test(void)
     log_diagnostic_stats("ambient", &ambient);
 
     diagnostic_stats_start();
-    s_playing = true;
+    portENTER_CRITICAL(&s_codec_write_lock);
+    if (!s_shutdown_requested) s_playing = true;
+    portEXIT_CRITICAL(&s_codec_write_lock);
     esp_err_t error = write_generation == codec_write_generation()
         ? set_amplifier_enabled(true) : ESP_ERR_INVALID_STATE;
     if (error == ESP_OK) {
@@ -1169,89 +1353,186 @@ esp_err_t audio_io_run_self_test(void)
     return error;
 }
 
+audio_playback_buffer_status_t audio_io_playback_buffer_status(void)
+{
+    portENTER_CRITICAL(&s_codec_write_lock);
+    const audio_playback_buffer_status_t status = {
+        .queued_bytes = s_buffered_bytes,
+        .capacity_bytes = PLAYBACK_BUFFER_CAPACITY_BYTES,
+        .underruns = s_playback_underruns,
+        .buffering = s_buffering && !s_shutdown_requested,
+    };
+    portEXIT_CRITICAL(&s_codec_write_lock);
+    return status;
+}
+
 esp_err_t audio_io_begin_response(const char *response_id, uint32_t sample_rate)
 {
-    if (!s_available) {
+    if (!s_available || response_id == NULL || response_id[0] == '\0') {
         return ESP_ERR_INVALID_STATE;
     }
-    portENTER_CRITICAL(&s_codec_write_lock);
-    const bool diagnostic_running = s_self_test_running;
-    portEXIT_CRITICAL(&s_codec_write_lock);
-    if (diagnostic_running) return ESP_ERR_INVALID_STATE;
-    audio_item_t item = {
-        .type = AUDIO_ITEM_BEGIN,
-        .sample_rate = sample_rate,
-    };
+    audio_item_t item = { .type = AUDIO_ITEM_BEGIN, .sample_rate = sample_rate };
     copy_response_id(item.response_id, response_id);
-    const esp_err_t error = enqueue_item(&item);
-    if (error == ESP_OK) {
+    portENTER_CRITICAL(&s_codec_write_lock);
+    esp_err_t error = ESP_OK;
+    if (s_self_test_running || s_shutdown_requested) error = ESP_ERR_INVALID_STATE;
+    else if (s_begin_pending) error = ESP_ERR_TIMEOUT;
+    else {
+        item.generation = ++s_codec_write_generation;
+        s_pending_begin = item;
+        s_begin_pending = true;
+        memcpy(s_response_id, item.response_id, sizeof(s_response_id));
+        s_response_open = true;
+        s_response_ended = false;
+        s_response_bytes = 0;
+        s_buffering = true;
         s_playing = true;
     }
+    portEXIT_CRITICAL(&s_codec_write_lock);
     return error;
 }
 
-esp_err_t audio_io_push_pcm(const uint8_t *data, size_t size)
+static esp_err_t push_pcm_for_generation(const uint8_t *data, size_t size,
+                                        uint32_t generation)
 {
-    if (!s_available) {
-        return ESP_ERR_INVALID_STATE;
+    if (!s_available || s_shutdown_requested) return ESP_ERR_INVALID_STATE;
+    if (data == NULL || size == 0 || (size % sizeof(int16_t)) != 0) return ESP_ERR_INVALID_ARG;
+    audio_item_t item = { .type = AUDIO_ITEM_PCM, .size = size };
+    portENTER_CRITICAL(&s_codec_write_lock);
+    esp_err_t error = ESP_OK;
+    if (generation != s_codec_write_generation || !s_response_open
+        || s_response_ended || s_shutdown_requested) error = ESP_ERR_INVALID_STATE;
+    else if (size > PLAYBACK_BUFFER_CAPACITY_BYTES - s_buffered_bytes) error = ESP_ERR_NO_MEM;
+    else {
+        item.generation = s_codec_write_generation;
+        item.reserved = true;
+        s_buffered_bytes += size;
+        s_response_bytes += size;
     }
-    if (data == NULL || size == 0 || (size % sizeof(int16_t)) != 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    audio_item_t item = {
-        .type = AUDIO_ITEM_PCM,
-        .data = heap_caps_malloc(size, MALLOC_CAP_8BIT),
-        .size = size,
-    };
+    portEXIT_CRITICAL(&s_codec_write_lock);
+    if (error != ESP_OK) return error;
+    // Both boards have PSRAM. Do not exhaust the much smaller internal heap
+    // needed by BLE if PSRAM is unavailable or allocation fails.
+    item.data = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (item.data == NULL) {
+        free_item(&item);
         return ESP_ERR_NO_MEM;
     }
     memcpy(item.data, data, size);
     return enqueue_item(&item);
 }
 
+esp_err_t audio_io_push_pcm(const uint8_t *data, size_t size)
+{
+    return push_pcm_for_generation(data, size, codec_write_generation());
+}
+
+esp_err_t audio_io_push_pcm_wait(const uint8_t *data, size_t size, uint32_t timeout_ms)
+{
+    if (size > PLAYBACK_BUFFER_CAPACITY_BYTES) return ESP_ERR_INVALID_ARG;
+    const uint32_t generation = codec_write_generation();
+    const int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (true) {
+        const esp_err_t error = push_pcm_for_generation(data, size, generation);
+        if (error != ESP_ERR_NO_MEM) {
+            if (error != ESP_OK) clear_failed_playback(generation);
+            return error;
+        }
+        if (esp_timer_get_time() >= deadline) {
+            clear_failed_playback(generation);
+            return ESP_ERR_TIMEOUT;
+        }
+        // A 4096-byte WebSocket fragment is about 85 ms of playback. Waiting
+        // here propagates backpressure through TCP without blocking BLE input.
+        vTaskDelay(pdMS_TO_TICKS(PLAYBACK_POLL_MS));
+    }
+}
+
 esp_err_t audio_io_end_response(const char *response_id)
 {
-    audio_item_t item = { .type = AUDIO_ITEM_END };
-    copy_response_id(item.response_id, response_id);
-    return enqueue_item(&item);
+    portENTER_CRITICAL(&s_codec_write_lock);
+    const bool matches = s_response_open && !s_shutdown_requested
+        && (response_id == NULL || response_id[0] == '\0'
+            || strcmp(response_id, s_response_id) == 0);
+    if (matches) s_response_ended = true;
+    portEXIT_CRITICAL(&s_codec_write_lock);
+    // The marker follows every already-reserved PCM byte, including an
+    // allocation/send in flight. No later PCM can reserve space after END.
+    return matches ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
 void audio_io_clear(const char *reason)
 {
-    ESP_LOGI(TAG, "Clearing playback (%s)", reason == NULL ? "unspecified" : reason);
-    if (s_playback_queue == NULL) {
-        return;
-    }
+    if (s_playback_queue == NULL || s_shutdown_requested) return;
     cancel_codec_writes();
-    // Silence the amplifier immediately, even if a PCM write is still draining.
+    // Silence immediately; the task frees old-generation PCM without blocking
+    // this control path or accidentally discarding a concurrently accepted BEGIN.
     ESP_ERROR_CHECK_WITHOUT_ABORT(set_amplifier_enabled(false));
-    audio_item_t pending = { 0 };
-    while (xQueueReceive(s_playback_queue, &pending, 0) == pdTRUE) {
-        free_item(&pending);
+    ESP_LOGI(TAG, "Clearing playback (%s)", reason == NULL ? "unspecified" : reason);
+}
+
+esp_err_t audio_io_shutdown(void)
+{
+    portENTER_CRITICAL(&s_codec_write_lock);
+    s_shutdown_requested = true;
+    s_capture_enabled = false;
+    s_playing = false;
+    s_available = false;
+    s_response_open = false;
+    s_response_bytes = 0;
+    s_buffering = false;
+    ++s_codec_write_generation;
+    portEXIT_CRITICAL(&s_codec_write_lock);
+
+    // Close the PA before any wait. Its enable path shares the shutdown gate,
+    // including a BEGIN/self-test that was already running on another task.
+    esp_err_t error = set_amplifier_enabled(false);
+    if (s_playback_queue != NULL) {
+        audio_item_t pending = { 0 };
+        while (xQueueReceive(s_playback_queue, &pending, 0) == pdTRUE) {
+            free_item(&pending);
+        }
     }
-    audio_item_t clear = { .type = AUDIO_ITEM_CLEAR };
-    (void)xQueueSendToFront(s_playback_queue, &clear, pdMS_TO_TICKS(200));
+    if (s_codec != NULL) {
+        const esp_err_t mute_error = codec_status(
+            esp_codec_dev_set_out_mute(s_codec, true), "mute codec for shutdown");
+        if (error == ESP_OK) error = mute_error;
+    }
+    if (s_codec_write_mutex != NULL && s_tx_channel != NULL) {
+        if (xSemaphoreTake(s_codec_write_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            const esp_err_t tx_error = i2s_channel_disable(s_tx_channel);
+            // A repeat shutdown or previous write failure may have stopped TX.
+            if (error == ESP_OK && tx_error != ESP_ERR_INVALID_STATE) error = tx_error;
+            xSemaphoreGive(s_codec_write_mutex);
+        } else if (error == ESP_OK) {
+            error = ESP_ERR_TIMEOUT;
+        }
+    }
+    // RX and frontend cleanup run on capture_task after its current read.
+    // The shared I2C bus remains available to display/power shutdown code.
+    return error;
 }
 
 void audio_io_set_capture_enabled(bool enabled)
 {
-    s_capture_enabled = enabled;
+    portENTER_CRITICAL(&s_codec_write_lock);
+    s_capture_enabled = enabled && !s_shutdown_requested;
+    portEXIT_CRITICAL(&s_codec_write_lock);
 }
 
 bool audio_io_is_playing(void)
 {
-    return s_playing;
+    return s_playing && !s_shutdown_requested;
 }
 
 bool audio_io_is_available(void)
 {
-    return s_available;
+    return s_available && !s_shutdown_requested;
 }
 
 bool audio_io_supports_voice_barge_in(void)
 {
-    return s_voice_frontend_ready;
+    return s_voice_frontend_ready && !s_shutdown_requested;
 }
 
 i2c_master_bus_handle_t audio_io_i2c_bus(void)
@@ -1276,6 +1557,11 @@ esp_err_t audio_io_init(audio_pcm_callback_t pcm_callback,
     return ESP_OK;
 }
 
+audio_playback_buffer_status_t audio_io_playback_buffer_status(void)
+{
+    return (audio_playback_buffer_status_t) { 0 };
+}
+
 esp_err_t audio_io_run_self_test(void)
 {
     return ESP_ERR_NOT_SUPPORTED;
@@ -1295,6 +1581,12 @@ esp_err_t audio_io_push_pcm(const uint8_t *data, size_t size)
     return ESP_ERR_NOT_SUPPORTED;
 }
 
+esp_err_t audio_io_push_pcm_wait(const uint8_t *data, size_t size, uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+    return audio_io_push_pcm(data, size);
+}
+
 esp_err_t audio_io_end_response(const char *response_id)
 {
     (void)response_id;
@@ -1304,6 +1596,11 @@ esp_err_t audio_io_end_response(const char *response_id)
 void audio_io_clear(const char *reason)
 {
     (void)reason;
+}
+
+esp_err_t audio_io_shutdown(void)
+{
+    return ESP_OK;
 }
 
 void audio_io_set_capture_enabled(bool enabled)

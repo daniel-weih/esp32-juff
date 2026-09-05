@@ -28,7 +28,7 @@ class AudioCodecWriteTest(unittest.TestCase):
                             r"\s*\} codec_write_context_t;", source).group()
         (output / "codec_write_config.inc").write_text(constants)
         (output / "codec_write.inc").write_text(context + "\n\n" + "\n\n".join(
-            function(source, name) for name in ("codec_write_generation", "cancel_codec_writes",
+            function(source, name) for name in ("codec_write_generation", "cancel_playback_state_locked", "cancel_codec_writes",
                 "write_i2s_bytes", "reset_codec_tx_locked", "write_codec_pcm_mono")))
         cls.executables = {}
         for small in (False, True):

@@ -63,10 +63,37 @@ The ES8311 side uses 24 kHz, signed PCM16 little-endian, mono.
 | Speaker | PCM16 mono | 8-bit G.711 μ-law | 24 kHz |
 
 Microphone capture is linearly resampled from 24 kHz to 16 kHz and sent in
-100 ms frames. Downstream Qwen PCM is μ-law encoded by JuffBLE. The Mac starts
-with a 300 ms speaker buffer, then uses a roughly 25.2 kB/s token bucket so
-CoreBluetooth does not burst data faster than the ESP32 playback queue can
-consume it. The device has roughly eight seconds of downstream buffering.
+100 ms frames. Downstream Qwen PCM is μ-law encoded by JuffBLE. Both hardware
+profiles reserve up to 192,000 bytes of decoded playback PCM in PSRAM, about
+four seconds at 24 kHz. The device prefills 300 ms before playback and refills
+250 ms after an underrun, with a 600 ms wait ceiling. An ended short response
+can start before reaching the prefill threshold.
+
+Firmware advertises `speakerFlow: 1` in `status`. For these devices, JuffBLE
+adds `flowControl: 1` and a nonzero `streamId` to `audio.begin`, then waits for
+`speaker.credit` before sending audio. Every speaker packet starts with two
+little-endian 32-bit words: the stream ID and the μ-law byte offset, followed
+by the encoded audio. `audio.done` carries the same stream ID.
+
+Credits carry `responseId`, `streamId`, `received`, `limit`, and `state`.
+`received` is the accepted μ-law byte count; `limit` is the cumulative upper
+bound the Mac may send, excluding packet headers. The device accounts for
+queued and currently written PCM plus BLE staging when publishing space.
+Snapshot creation and notification publication are serialized to prevent
+concurrent updates from arriving out of order. The Mac also respects
+CoreBluetooth write readiness and queues excess synthesis within a 2 MiB
+encoded-audio limit. Responses stay ordered through playback completion.
+Older firmware retains headerless μ-law and the 25,200 B/s token bucket with
+a 7,200-byte burst allowance.
+
+Microphone notifications remain headerless μ-law. Starting with `0.6.10-dev`,
+the microphone sender queues a complete `microphone.reset` status notification
+before a new stream generation or after abandoning a partially sent frame.
+The updated Mac helper clears its incomplete 1600-byte frame on this boundary;
+firmware sends no new PCM until the boundary is queued successfully. Rejected
+fragments retry with at least one scheduler tick, bounded by 200 ms per fragment
+and 400 ms per frame. Both firmware and helper must be updated for boundary
+recovery; the new helper still accepts older firmware's continuous byte stream.
 
 Each response has `audio.begin`, streamed audio, and `audio.done` lifecycle
 events. `playback.clear` immediately discards queued data and turns off the
@@ -110,16 +137,22 @@ retain their previous values.
 Detection waits for actual PCM playback and active reference energy, then
 400 ms of warmup. It requires 120 ms of continuous speech above
 `max(180 RMS, 3 × estimated noise RMS)`.
+The small board additionally checks a roughly 128 ms window of complete AEC
+blocks. While reference RMS is at least 80, processed speech must retain at
+least 1% of raw microphone power. This empirical residual-echo guard does not
+change the large board's detection parameters.
 
 On detection, the device stops playback and sends `interrupt` before resuming
-microphone upload, including 300 ms of speech history and frames captured
-before upload resumes. BLE transmission remains half-duplex; the cloud gets
+microphone upload, including up to 800 ms of speech history on the small board
+or 300 ms on the large board, plus frames captured before upload resumes.
+BLE transmission remains half-duplex; the cloud gets
 no microphone stream during playback. `input.suspend` disables detection and
 clears buffered speech.
 
 Both profiles use a 64 KB data cache with 64-byte lines and external
-NimBLE allocations. The frontend's 4800-sample history and 8000-sample pending
-buffer occupy 25,600 bytes in PSRAM. DMA buffers, AEC work frames and task
+NimBLE allocations. Small-board history and pending buffers contain 12,800
+and 16,000 PCM16 samples, occupying 57,600 bytes in PSRAM; the large board's
+4,800- and 8,000-sample buffers occupy 25,600 bytes. DMA buffers, AEC work frames and task
 stacks remain internal. Failed frontend initialization releases partial
 allocations and falls back to ordinary half-duplex audio.
 
@@ -139,6 +172,12 @@ WebSocket. This path transports PCM16 directly:
 - 24 kHz PCM16 speaker frames downstream
 - a random shared device token in the initial `hello` message
 - `audio.begin`, `audio.done`, playback, state, and interruption events
+
+The 4096-byte receive callback waits for playback to release space when the
+shared PCM buffer is full, applying backpressure through TCP with a 200 ms
+space-wait budget. Failure cancels that response and rejects its remaining
+audio until another valid `audio.begin`. A waiting block retains its original
+playback generation, so it cannot enter or cancel a newer response.
 
 The Bridge is disabled for LAN access by default because it binds to loopback.
 Changing `JUFF_BRIDGE_HOST` to `0.0.0.0` is an explicit opt-in.

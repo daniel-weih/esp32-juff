@@ -33,6 +33,7 @@ static volatile bool s_transport_connected;
 static volatile bool s_voice_ready;
 static volatile bool s_input_suspended;
 static bool s_binary_message;
+static bool s_reject_response_audio = true;
 static char s_text_message[TEXT_MESSAGE_SIZE];
 static char s_bridge_uri[BRIDGE_URI_SIZE];
 static char s_device_token[DEVICE_TOKEN_SIZE];
@@ -209,6 +210,7 @@ static void handle_json_message(const char *data, size_t size)
         const esp_err_t error = audio_io_begin_response(
             json_string(message, "responseId"),
             json_number(message, "sampleRate", 24000));
+        s_reject_response_audio = error != ESP_OK;
         if (error != ESP_OK && error != ESP_ERR_NOT_SUPPORTED) {
             ESP_LOGW(TAG, "Unable to begin playback: %s", esp_err_to_name(error));
         }
@@ -216,6 +218,7 @@ static void handle_json_message(const char *data, size_t size)
         (void)audio_io_end_response(json_string(message, "responseId"));
         board_display_set_voice_state("idle");
     } else if (strcmp(type, "playback.clear") == 0) {
+        s_reject_response_audio = true;
         board_display_set_voice_state("idle");
         audio_io_clear(json_string(message, "reason"));
     } else if (strcmp(type, "input.suspend") == 0) {
@@ -247,10 +250,14 @@ static void handle_data_event(const esp_websocket_event_data_t *event)
     }
 
     if (s_binary_message) {
-        const esp_err_t error = audio_io_push_pcm((const uint8_t *)event->data_ptr,
-                                                   event->data_len);
+        if (s_reject_response_audio) return;
+        const esp_err_t error = audio_io_push_pcm_wait((const uint8_t *)event->data_ptr,
+                                                      event->data_len, 200);
         if (error != ESP_OK && error != ESP_ERR_NOT_SUPPORTED) {
-            ESP_LOGW(TAG, "Dropping speaker PCM: %s", esp_err_to_name(error));
+            // Do not continue a response with a hole if the bounded wait fails.
+            s_reject_response_audio = true;
+            // The waiting API cancels only its original playback generation.
+            ESP_LOGW(TAG, "Cancelled Wi-Fi playback: %s", esp_err_to_name(error));
         }
         return;
     }
@@ -281,6 +288,7 @@ static void websocket_event(void *handler_args,
         ESP_LOGI(TAG, "Connected to host bridge");
         send_hello();
     } else if (event_id == WEBSOCKET_EVENT_DISCONNECTED) {
+        s_reject_response_audio = true;
         s_transport_connected = false;
         s_voice_ready = false;
         audio_io_set_capture_enabled(false);

@@ -7,6 +7,8 @@
 #include <string.h>
 
 #include "audio_io.h"
+#include "battery_monitor.h"
+#include "speaker_flow.h"
 #include "board_config.h"
 #include "board_display.h"
 #include "cJSON.h"
@@ -41,10 +43,11 @@
 #define BLE_COMMAND_QUEUE_DEPTH 4
 #define BLE_MIC_PCM_FRAME_MAX_BYTES 3200
 #define BLE_MIC_ENCODED_FRAME_MAX_BYTES (BLE_MIC_PCM_FRAME_MAX_BYTES / 2)
-#define BLE_MIC_QUEUE_DEPTH 5
+#define BLE_MIC_QUEUE_DEPTH 12
+#define BLE_MIC_NOTIFY_TIMEOUT_MS 200
+#define BLE_MIC_FRAME_TIMEOUT_MS 400
 #define BLE_SPEAKER_CHUNK_BYTES 4800
 #define BLE_SPEAKER_BUFFER_BYTES (BLE_SPEAKER_CHUNK_BYTES * 4)
-#define BLE_NOTIFY_RETRY_COUNT 8
 #define BLE_PAIRING_WINDOW_MS 120000U
 #define BLE_PAIRING_BLOCKED_PEERS_MAX 4
 
@@ -54,6 +57,8 @@ typedef struct {
 
 typedef struct {
     uint16_t size;
+    uint16_t connection_handle;
+    uint32_t generation;
     uint8_t data[BLE_MIC_ENCODED_FRAME_MAX_BYTES];
 } ble_audio_frame_t;
 
@@ -85,6 +90,19 @@ static const ble_uuid128_t s_speaker_uuid = BLE_UUID128_INIT(
 static QueueHandle_t s_command_queue;
 static QueueHandle_t s_microphone_queue;
 static SemaphoreHandle_t s_speaker_mutex;
+static SemaphoreHandle_t s_notify_mutex;
+// Serialize credit snapshots through publication, not only JSON fragments.
+static SemaphoreHandle_t s_credit_mutex;
+static bool s_notify_needs_separator;
+static portMUX_TYPE s_flow_lock = portMUX_INITIALIZER_UNLOCKED;
+static speaker_flow_t s_speaker_flow;
+static bool s_flow_enabled;
+static bool s_flow_abort_requested;
+static char s_flow_response[64];
+// Terminal events are retained and repeated so a lost notification cannot stall
+// the sender forever. The flow lock never encloses queue, codec or BLE I/O.
+static const char *s_flow_state = "cancelled";
+static uint8_t s_phy_tx, s_phy_rx;
 static uint8_t s_own_addr_type;
 static uint16_t s_control_handle;
 static uint16_t s_status_handle;
@@ -97,6 +115,12 @@ static bool s_voice_ready;
 // Host input suspension and half-duplex playback have independent lifetimes.
 static bool s_input_suspended;
 static bool s_playback_suspended;
+// Invalidate queued and partially sent microphone frames at every capture
+// boundary, even if mute/resume or disconnect/reconnect finishes between retries.
+static uint32_t s_microphone_generation;
+// Owned only by microphone_task. A boundary is sent before any new PCM bytes.
+static uint32_t s_microphone_sent_generation;
+static bool s_microphone_needs_reset = true;
 static bool s_speaker_response_active;
 static bool s_advertising;
 static bool s_started;
@@ -259,6 +283,10 @@ static void set_link_state(uint16_t connection_handle,
                            bool advertising)
 {
     portENTER_CRITICAL(&s_state_lock);
+    if (s_connection_handle != connection_handle
+        || connection_handle == BLE_HS_CONN_HANDLE_NONE) {
+        ++s_microphone_generation;
+    }
     s_connection_handle = connection_handle;
     s_notify_enabled = notify_enabled;
     s_advertising = advertising;
@@ -274,6 +302,7 @@ static void set_link_state(uint16_t connection_handle,
 static void mark_connected(uint16_t connection_handle)
 {
     portENTER_CRITICAL(&s_state_lock);
+    if (s_connection_handle != connection_handle) ++s_microphone_generation;
     s_connection_handle = connection_handle;
     /*
      * A bonded macOS central can restore encryption and the CCCD almost
@@ -286,6 +315,22 @@ static void mark_connected(uint16_t connection_handle)
 
 static size_t build_status(char *buffer, size_t buffer_size)
 {
+    const battery_status_t battery = battery_monitor_get();
+    char battery_json[128] = "";
+    if (battery.supported) {
+        char percent[12] = "null";
+        if (battery.percent >= 0) {
+            snprintf(percent, sizeof(percent), "%d", battery.percent);
+        }
+        const int battery_length = snprintf(
+            battery_json, sizeof(battery_json),
+            ",\"battery\":{\"valid\":%s,\"charging\":%s,\"percent\":%s,\"millivolts\":%d}",
+            battery.valid ? "true" : "false",
+            battery.charging ? "true" : "false", percent, battery.millivolts);
+        if (battery_length < 0 || (size_t)battery_length >= sizeof(battery_json)) {
+            return 0;
+        }
+    }
     const bool ble_voice = ble_manager_is_voice_active();
     const bool bridge_connected = ble_manager_audio_is_connected()
         || device_client_is_connected();
@@ -295,7 +340,7 @@ static size_t build_status(char *buffer, size_t buffer_size)
         buffer_size,
         "{\"type\":\"status\",\"name\":\"%s\",\"firmware\":\"%s\",\"board\":\"%s\","
         "\"wifiConfigured\":%s,\"wifi\":%s,\"ble\":%s,\"pairing\":%s,\"bridge\":%s,"
-        "\"voice\":%s,\"bleAudio\":%s,\"audio\":%s,\"playing\":%s,\"voiceInterrupt\":%s}",
+        "\"voice\":%s,\"bleAudio\":%s,\"audio\":%s,\"playing\":%s,\"voiceInterrupt\":%s,\"speakerFlow\":1,\"phyTx\":%u,\"phyRx\":%u%s}",
         s_device_name,
         esp_app_get_description()->version,
         JUFF_BOARD_ID,
@@ -308,7 +353,8 @@ static size_t build_status(char *buffer, size_t buffer_size)
         ble_manager_audio_is_connected() ? "true" : "false",
         audio_io_is_available() ? "true" : "false",
         audio_io_is_playing() ? "true" : "false",
-        audio_io_supports_voice_barge_in() ? "true" : "false");
+        audio_io_supports_voice_barge_in() ? "true" : "false",
+        (unsigned)s_phy_tx, (unsigned)s_phy_rx, battery_json);
     if (length < 0 || (size_t)length >= buffer_size) {
         return 0;
     }
@@ -317,50 +363,43 @@ static size_t build_status(char *buffer, size_t buffer_size)
 
 static bool notify_text(const char *text)
 {
-    if (text == NULL || text[0] == '\0') {
-        return false;
-    }
-
+    if (text == NULL || text[0] == '\0' || s_notify_mutex == NULL) return false;
+    const size_t text_length = strlen(text);
+    if (text_length > BLE_MESSAGE_MAX_BYTES) return false;
+    if (xSemaphoreTake(s_notify_mutex, pdMS_TO_TICKS(20)) != pdTRUE) return false;
     uint16_t connection_handle;
     bool notify_enabled;
     snapshot_link_state(&connection_handle, &notify_enabled, NULL);
-    if (connection_handle == BLE_HS_CONN_HANDLE_NONE || !notify_enabled) {
-        return false;
-    }
-
-    const size_t text_length = strlen(text);
-    if (text_length > BLE_MESSAGE_MAX_BYTES) {
-        return false;
-    }
+    bool success = false;
+    if (connection_handle == BLE_HS_CONN_HANDLE_NONE || !notify_enabled) goto done;
     char framed[BLE_MESSAGE_MAX_BYTES + 2];
-    memcpy(framed, text, text_length);
-    framed[text_length] = '\n';
-    const size_t framed_length = text_length + 1;
-
+    size_t prefix = s_notify_needs_separator ? 1 : 0;
+    if (prefix != 0) framed[0] = '\n';
+    memcpy(framed + prefix, text, text_length);
+    framed[prefix + text_length] = '\n';
+    const size_t framed_length = prefix + text_length + 1;
     const uint16_t mtu = ble_att_mtu(connection_handle);
     const size_t chunk_size = mtu > 3 ? mtu - 3 : 20;
     size_t offset = 0;
     while (offset < framed_length) {
         const size_t remaining = framed_length - offset;
         const size_t length = remaining < chunk_size ? remaining : chunk_size;
-        struct os_mbuf *packet = ble_hs_mbuf_from_flat(framed + offset,
-                                                       (uint16_t)length);
-        if (packet == NULL) {
-            return false;
-        }
-        const int result = ble_gatts_notify_custom(connection_handle,
-                                                    s_status_handle,
-                                                    packet);
+        struct os_mbuf *packet = ble_hs_mbuf_from_flat(framed + offset, (uint16_t)length);
+        if (packet == NULL) { s_notify_needs_separator = true; goto done; }
+        const int result = ble_gatts_notify_custom(connection_handle, s_status_handle, packet);
         if (result != 0) {
+            s_notify_needs_separator = true;
             ESP_LOGW(TAG, "Status notification failed: %d", result);
-            return false;
+            goto done;
         }
         offset += length;
-        if (offset < framed_length) {
-            vTaskDelay(pdMS_TO_TICKS(5));
-        }
+        if (offset < framed_length) vTaskDelay(pdMS_TO_TICKS(5));
     }
-    return true;
+    s_notify_needs_separator = false;
+    success = true;
+done:
+    xSemaphoreGive(s_notify_mutex);
+    return success;
 }
 
 static void notify_current_status(void)
@@ -413,88 +452,280 @@ static bool queue_received_byte(uint8_t value)
     return true;
 }
 
-static void flush_speaker_locked(bool include_partial)
+static bool valid_flow_response(const char *value)
 {
-    while (s_speaker_response_active
-           && (s_speaker_length >= BLE_SPEAKER_CHUNK_BYTES
-               || (include_partial && s_speaker_length >= sizeof(int16_t)))) {
-        size_t size = s_speaker_length >= BLE_SPEAKER_CHUNK_BYTES
-            ? BLE_SPEAKER_CHUNK_BYTES
-            : s_speaker_length;
-        size &= ~(sizeof(int16_t) - 1U);
-        if (size == 0) {
-            break;
-        }
-        const esp_err_t error = audio_io_push_pcm(s_speaker_buffer, size);
-        if (error != ESP_OK && error != ESP_ERR_NOT_SUPPORTED) {
-            ESP_LOGW(TAG, "Dropping BLE speaker PCM: %s", esp_err_to_name(error));
-        }
-        const size_t remaining = s_speaker_length - size;
-        if (remaining > 0) {
-            memmove(s_speaker_buffer, s_speaker_buffer + size, remaining);
-        }
-        s_speaker_length = remaining;
+    if (value == NULL || value[0] == '\0' || strlen(value) >= sizeof(s_flow_response)) return false;
+    for (const char *p = value; *p != '\0'; ++p) {
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.' || *p == ':')) return false;
     }
+    return true;
 }
 
-static void append_speaker_data(const uint8_t *data, size_t size)
+static void mark_speaker_terminal(const char *response_id, const char *state)
 {
-    if (data == NULL || size == 0 || s_speaker_mutex == NULL
-        || xSemaphoreTake(s_speaker_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
-        s_dropped_speaker_bytes += size;
+    portENTER_CRITICAL(&s_flow_lock);
+    if (s_flow_enabled && strcmp(response_id, s_flow_response) == 0) {
+        speaker_flow_cancel(&s_speaker_flow);
+        s_flow_state = state;
+    }
+    portEXIT_CRITICAL(&s_flow_lock);
+}
+
+static void notify_speaker_credit(void)
+{
+    // Queue occupancy and staging must be sampled together with received. A new
+    // packet must not be counted once as free space and again as received bytes.
+    // Keep the publication lock until notify_text has queued this snapshot so
+    // another producer cannot send a newer limit before this one. Contending
+    // publishers skip this attempt and retry on the next periodic update.
+    if (s_credit_mutex == NULL || xSemaphoreTake(s_credit_mutex, 0) != pdTRUE) return;
+    if (s_speaker_mutex == NULL || xSemaphoreTake(s_speaker_mutex, 0) != pdTRUE) {
+        xSemaphoreGive(s_credit_mutex);
         return;
     }
+    portENTER_CRITICAL(&s_flow_lock);
+    const bool abort_stream = s_flow_abort_requested;
+    s_flow_abort_requested = false;
+    portEXIT_CRITICAL(&s_flow_lock);
+    if (abort_stream) {
+        s_speaker_response_active = false;
+        s_speaker_length = 0;
+        audio_io_clear("BLE speaker receive contention");
+    }
+    const audio_playback_buffer_status_t buffer = audio_io_playback_buffer_status();
+    char message[320];
+    int length = 0;
+    portENTER_CRITICAL(&s_flow_lock);
+    if (s_flow_enabled) {
+        const size_t occupied = (size_t)buffer.queued_bytes + s_speaker_length;
+        const uint32_t free_bytes = occupied < buffer.capacity_bytes
+            ? (uint32_t)(buffer.capacity_bytes - occupied) : 0;
+        // The helper refuses counter overflow rather than wrapping the window.
+        if (s_speaker_flow.active && !s_speaker_flow.draining &&
+            !speaker_flow_publish(&s_speaker_flow, free_bytes / 2)) {
+            speaker_flow_cancel(&s_speaker_flow);
+            s_flow_state = "cancelled";
+        }
+        length = snprintf(message, sizeof(message),
+            "{\"type\":\"speaker.credit\",\"responseId\":\"%s\",\"streamId\":%" PRIu32
+            ",\"received\":%" PRIu32 ",\"limit\":%" PRIu32 ",\"state\":\"%s\","
+            "\"queuedMs\":%u,\"underruns\":%" PRIu32 ",\"dropped\":%" PRIu32 "}",
+            s_flow_response, s_speaker_flow.stream_id, s_speaker_flow.received,
+            s_speaker_flow.limit, s_flow_state,
+            (unsigned)(occupied / 48), buffer.underruns, s_dropped_speaker_bytes);
+    }
+    portEXIT_CRITICAL(&s_flow_lock);
+    xSemaphoreGive(s_speaker_mutex);
+    if (length > 0 && (size_t)length < sizeof(message)) (void)notify_text(message);
+    xSemaphoreGive(s_credit_mutex);
+}
 
+static bool flush_speaker_locked(bool include_partial)
+{
+    while (s_speaker_response_active &&
+           (s_speaker_length >= BLE_SPEAKER_CHUNK_BYTES ||
+            (include_partial && s_speaker_length >= sizeof(int16_t)))) {
+        size_t size = s_speaker_length >= BLE_SPEAKER_CHUNK_BYTES
+            ? BLE_SPEAKER_CHUNK_BYTES : s_speaker_length;
+        size &= ~(sizeof(int16_t) - 1U);
+        if (size == 0) break;
+        const esp_err_t error = audio_io_push_pcm(s_speaker_buffer, size);
+        if (error != ESP_OK) {
+            s_dropped_speaker_bytes += (uint32_t)s_speaker_length;
+            s_speaker_length = 0;
+            ESP_LOGW(TAG, "BLE speaker enqueue failed: %s", esp_err_to_name(error));
+            return false;
+        }
+        const size_t remaining = s_speaker_length - size;
+        if (remaining > 0) memmove(s_speaker_buffer, s_speaker_buffer + size, remaining);
+        s_speaker_length = remaining;
+    }
+    return true;
+}
+
+static bool append_speaker_data_locked(const uint8_t *data, size_t size)
+{
     size_t offset = 0;
     while (offset < size) {
-        if (s_speaker_response_active) {
-            flush_speaker_locked(false);
-        }
+        if (s_speaker_response_active && !flush_speaker_locked(false)) return false;
         const size_t free_bytes = sizeof(s_speaker_buffer) - s_speaker_length;
-        if (free_bytes == 0) {
-            s_dropped_speaker_bytes += size - offset;
-            break;
-        }
-        const size_t copy_size = size - offset < free_bytes
-            ? size - offset
-            : free_bytes;
+        if (free_bytes == 0) return false;
+        const size_t copy_size = size - offset < free_bytes ? size - offset : free_bytes;
         memcpy(s_speaker_buffer + s_speaker_length, data + offset, copy_size);
         s_speaker_length += copy_size;
         offset += copy_size;
     }
-    if (s_speaker_response_active) {
-        flush_speaker_locked(false);
-    }
-    xSemaphoreGive(s_speaker_mutex);
+    return !s_speaker_response_active || flush_speaker_locked(false);
+}
+
+static uint32_t speaker_read_le32(const uint8_t *data)
+{
+    return (uint32_t)data[0] | (uint32_t)data[1] << 8 |
+           (uint32_t)data[2] << 16 | (uint32_t)data[3] << 24;
 }
 
 static void append_speaker_mulaw(const uint8_t *data, size_t size)
 {
-    uint8_t pcm[256];
-    while (data != NULL && size > 0) {
-        const size_t sample_count = size < (sizeof(pcm) / sizeof(int16_t))
-            ? size
-            : (sizeof(pcm) / sizeof(int16_t));
-        for (size_t index = 0; index < sample_count; ++index) {
-            const uint16_t sample = (uint16_t)mulaw_to_linear_pcm(data[index]);
-            pcm[index * 2] = (uint8_t)(sample & 0xff);
-            pcm[index * 2 + 1] = (uint8_t)(sample >> 8);
+    if (data == NULL || size == 0 || s_speaker_mutex == NULL) return;
+    if (xSemaphoreTake(s_speaker_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        // Do not silently continue a corrupt stream. The command worker will
+        // publish a terminal state even if a BLE callback cannot take the lock.
+        portENTER_CRITICAL(&s_flow_lock);
+        s_dropped_speaker_bytes += (uint32_t)size;
+        if (s_flow_enabled && size > 8 && speaker_read_le32(data) == s_speaker_flow.stream_id) {
+            speaker_flow_cancel(&s_speaker_flow);
+            s_flow_state = "cancelled";
+            s_flow_abort_requested = true;
         }
-        append_speaker_data(pcm, sample_count * sizeof(int16_t));
-        data += sample_count;
-        size -= sample_count;
+        portEXIT_CRITICAL(&s_flow_lock);
+        return;
     }
+    bool failed = false, stale = false;
+    uint32_t stream_id = 0, offset = 0;
+    portENTER_CRITICAL(&s_flow_lock);
+    const bool flow_enabled = s_flow_enabled;
+    if (flow_enabled) {
+        if (size <= 8) failed = true;
+        else {
+            stream_id = speaker_read_le32(data);
+            offset = speaker_read_le32(data + 4);
+            data += 8;
+            size -= 8;
+            const speaker_flow_result_t result = speaker_flow_accept(
+                &s_speaker_flow, stream_id, offset, size);
+            stale = result == SPEAKER_FLOW_STALE;
+            failed = !stale && result != SPEAKER_FLOW_OK;
+        }
+    }
+    portEXIT_CRITICAL(&s_flow_lock);
+    if (stale) { xSemaphoreGive(s_speaker_mutex); return; }
+    if (!failed) {
+        uint8_t pcm[256];
+        const uint8_t *cursor = data;
+        size_t remaining = size;
+        while (remaining > 0) {
+            const size_t count = remaining < sizeof(pcm) / 2 ? remaining : sizeof(pcm) / 2;
+            for (size_t index = 0; index < count; ++index) {
+                const uint16_t sample = (uint16_t)mulaw_to_linear_pcm(cursor[index]);
+                pcm[index * 2] = (uint8_t)sample;
+                pcm[index * 2 + 1] = (uint8_t)(sample >> 8);
+            }
+            if (!append_speaker_data_locked(pcm, count * 2)) { failed = true; break; }
+            cursor += count;
+            remaining -= count;
+        }
+    }
+    portENTER_CRITICAL(&s_flow_lock);
+    if (!failed && flow_enabled) {
+        failed = speaker_flow_commit(&s_speaker_flow, stream_id, offset, size) != SPEAKER_FLOW_OK;
+    }
+    if (failed) {
+        s_dropped_speaker_bytes += (uint32_t)size;
+        speaker_flow_cancel(&s_speaker_flow);
+        s_flow_state = "cancelled";
+        s_speaker_response_active = false;
+        s_speaker_length = 0;
+    }
+    portEXIT_CRITICAL(&s_flow_lock);
+    if (failed) audio_io_clear("BLE speaker packet rejected");
+    xSemaphoreGive(s_speaker_mutex);
 }
 
 static void reset_speaker_stream(void)
 {
-    if (s_speaker_mutex == NULL
-        || xSemaphoreTake(s_speaker_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-        return;
-    }
+    portENTER_CRITICAL(&s_flow_lock);
+    speaker_flow_cancel(&s_speaker_flow);
+    s_flow_state = "cancelled";
+    portEXIT_CRITICAL(&s_flow_lock);
+    if (s_speaker_mutex == NULL || xSemaphoreTake(s_speaker_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
     s_speaker_response_active = false;
     s_speaker_length = 0;
     xSemaphoreGive(s_speaker_mutex);
+}
+
+static esp_err_t begin_ble_speaker(const char *response_id, uint32_t sample_rate,
+                                   uint32_t flow_version, uint32_t stream_id)
+{
+    if (flow_version > 1 || (flow_version == 1 &&
+        (!valid_flow_response(response_id) || stream_id == 0 || sample_rate != 24000))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_speaker_mutex == NULL || xSemaphoreTake(s_speaker_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    const audio_playback_buffer_status_t buffer = audio_io_playback_buffer_status();
+    const size_t occupied = buffer.queued_bytes;
+    const size_t free_bytes = occupied < buffer.capacity_bytes ? buffer.capacity_bytes - occupied : 0;
+    portENTER_CRITICAL(&s_flow_lock);
+    speaker_flow_t next_flow = s_speaker_flow;
+    const bool allowed = flow_version == 0 || speaker_flow_start(&next_flow, stream_id, free_bytes / 2);
+    portEXIT_CRITICAL(&s_flow_lock);
+    esp_err_t error = allowed ? audio_io_begin_response(response_id, sample_rate) : ESP_ERR_INVALID_ARG;
+    if (error == ESP_OK) {
+        portENTER_CRITICAL(&s_flow_lock);
+        s_flow_enabled = flow_version == 1;
+        if (s_flow_enabled) s_speaker_flow = next_flow;
+        else speaker_flow_cancel(&s_speaker_flow);
+        strlcpy(s_flow_response, response_id, sizeof(s_flow_response));
+        s_flow_state = "open";
+        s_flow_abort_requested = false;
+        portEXIT_CRITICAL(&s_flow_lock);
+        // V1 never sends before initial credit; legacy clients may have queued
+        // unframed data while the asynchronous BEGIN command was pending.
+        if (flow_version == 1 || s_speaker_response_active) s_speaker_length = 0;
+        s_speaker_response_active = true;
+        if (!flush_speaker_locked(false)) {
+            error = ESP_ERR_NO_MEM;
+            mark_speaker_terminal(response_id, "cancelled");
+            s_speaker_response_active = false;
+            s_speaker_length = 0;
+            audio_io_clear("BLE initial speaker enqueue failed");
+        }
+    }
+    if (error == ESP_OK) {
+        portENTER_CRITICAL(&s_state_lock);
+        ++s_microphone_generation;
+        s_playback_suspended = true;
+        portEXIT_CRITICAL(&s_state_lock);
+        board_display_set_voice_state("speaking");
+        audio_io_set_capture_enabled(false);
+    }
+    xSemaphoreGive(s_speaker_mutex);
+    notify_speaker_credit();
+    return error;
+}
+
+static esp_err_t end_ble_speaker(const char *response_id, uint32_t stream_id)
+{
+    if (s_speaker_mutex == NULL || xSemaphoreTake(s_speaker_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    portENTER_CRITICAL(&s_flow_lock);
+    const bool flow_enabled = s_flow_enabled;
+    const bool matches = strcmp(response_id, s_flow_response) == 0 &&
+        (!flow_enabled || (stream_id == s_speaker_flow.stream_id && s_speaker_flow.active));
+    const bool already_draining = flow_enabled && s_speaker_flow.draining;
+    portEXIT_CRITICAL(&s_flow_lock);
+    esp_err_t error = ESP_OK;
+    if (!matches) error = ESP_ERR_INVALID_ARG;
+    else if (!already_draining) {
+        if (!flush_speaker_locked(true)) error = ESP_ERR_NO_MEM;
+        // Publish draining BEFORE END can complete on another core, so even an
+        // empty response's immediate ended callback leaves a terminal credit.
+        if (error == ESP_OK) {
+            portENTER_CRITICAL(&s_flow_lock);
+            if (flow_enabled && !speaker_flow_drain(&s_speaker_flow)) error = ESP_ERR_INVALID_STATE;
+            else s_flow_state = "draining";
+            portEXIT_CRITICAL(&s_flow_lock);
+        }
+        if (error == ESP_OK) error = audio_io_end_response(response_id);
+        if (error != ESP_OK) {
+            mark_speaker_terminal(response_id, "cancelled");
+            audio_io_clear("BLE speaker END rejected");
+        }
+        s_speaker_response_active = false;
+        s_speaker_length = 0;
+    }
+    xSemaphoreGive(s_speaker_mutex);
+    notify_speaker_credit();
+    return error;
 }
 
 static int gatt_access(uint16_t connection_handle,
@@ -532,11 +763,15 @@ static int gatt_access(uint16_t connection_handle,
 
     if (attribute_handle == s_speaker_handle
         && context->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        for (struct os_mbuf *packet = context->om;
-             packet != NULL;
+        uint8_t value[BLE_MESSAGE_MAX_BYTES];
+        size_t length = 0;
+        for (struct os_mbuf *packet = context->om; packet != NULL;
              packet = SLIST_NEXT(packet, om_next)) {
-            append_speaker_mulaw(packet->om_data, packet->om_len);
+            if (packet->om_len > sizeof(value) - length) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            memcpy(value + length, packet->om_data, packet->om_len);
+            length += packet->om_len;
         }
+        append_speaker_mulaw(value, length);
         return 0;
     }
     return BLE_ATT_ERR_UNLIKELY;
@@ -695,6 +930,22 @@ static int gap_event(struct ble_gap_event *event, void *argument)
         }
         s_incoming_length = 0;
         mark_connected(event->connect.conn_handle);
+        s_phy_tx = s_phy_rx = 1; // A new uncoded LE connection starts on 1M.
+        if (s_speaker_mutex != NULL && xSemaphoreTake(s_speaker_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            portENTER_CRITICAL(&s_flow_lock);
+            s_speaker_flow = (speaker_flow_t){0};
+            s_flow_enabled = false;
+            s_flow_response[0] = '\0';
+            s_flow_abort_requested = false;
+            portEXIT_CRITICAL(&s_flow_lock);
+            s_speaker_response_active = false;
+            s_speaker_length = 0;
+            xSemaphoreGive(s_speaker_mutex);
+        } else {
+            // A new connection must never inherit another central's credits.
+            (void)ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            return 0;
+        }
         if (ble_manager_is_pairing()) {
             board_display_set_notice("New Mac found",
                                      "Securing your new private audio link",
@@ -713,17 +964,22 @@ static int gap_event(struct ble_gap_event *event, void *argument)
         }
         return 0;
 
-    case BLE_GAP_EVENT_DISCONNECT:
+    case BLE_GAP_EVENT_DISCONNECT: {
         ESP_LOGI(TAG, "BLE central disconnected: %d", event->disconnect.reason);
+        portENTER_CRITICAL(&s_state_lock);
+        const bool owned_playback = s_playback_suspended;
+        portEXIT_CRITICAL(&s_state_lock);
         s_incoming_length = 0;
         set_link_state(BLE_HS_CONN_HANDLE_NONE, false, false);
         board_display_set_voice_state("idle");
         reset_speaker_stream();
+        if (owned_playback) audio_io_clear("BLE audio disconnected");
         if (!device_client_is_ready()) {
             audio_io_set_capture_enabled(false);
         }
         start_advertising();
         return 0;
+    }
 
     case BLE_GAP_EVENT_ENC_CHANGE: {
         struct ble_gap_conn_desc description;
@@ -771,6 +1027,7 @@ static int gap_event(struct ble_gap_event *event, void *argument)
             portENTER_CRITICAL(&s_state_lock);
             s_microphone_notify_enabled = event->subscribe.cur_notify != 0;
             if (!s_microphone_notify_enabled) {
+                ++s_microphone_generation;
                 s_voice_ready = false;
             }
             portEXIT_CRITICAL(&s_state_lock);
@@ -782,6 +1039,25 @@ static int gap_event(struct ble_gap_event *event, void *argument)
                      event->subscribe.cur_notify ? "enabled" : "disabled");
         }
         return 0;
+
+    case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
+        if (event->phy_updated.status == 0) {
+            s_phy_tx = event->phy_updated.tx_phy;
+            s_phy_rx = event->phy_updated.rx_phy;
+            ESP_LOGI(TAG, "BLE PHY negotiated: TX=%u RX=%u (1=1M, 2=2M)",
+                     (unsigned)s_phy_tx, (unsigned)s_phy_rx);
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_CONN_UPDATE: {
+        struct ble_gap_conn_desc description;
+        if (event->conn_update.status == 0 &&
+            ble_gap_conn_find(event->conn_update.conn_handle, &description) == 0) {
+            ESP_LOGI(TAG, "BLE connection interval: %u x 1.25ms, latency=%u",
+                     (unsigned)description.conn_itvl, (unsigned)description.conn_latency);
+        }
+        return 0;
+    }
 
     case BLE_GAP_EVENT_MTU:
         ESP_LOGI(TAG, "BLE MTU negotiated: %u", event->mtu.value);
@@ -847,6 +1123,7 @@ static void handle_command(const char *text)
 
     if (strcmp(type, "status") == 0) {
         notify_current_status();
+        notify_speaker_credit();
     } else if (strcmp(type, "device.ready") == 0) {
         ESP_LOGI(TAG,
                  "Mac BLE audio bridge ready (model=%s)",
@@ -858,6 +1135,7 @@ static void handle_command(const char *text)
         bool microphone_notify_enabled;
         snapshot_audio_state(&microphone_notify_enabled, NULL, NULL);
         portENTER_CRITICAL(&s_state_lock);
+        ++s_microphone_generation;
         s_voice_ready = microphone_notify_enabled;
         s_input_suspended = false;
         s_playback_suspended = false;
@@ -873,6 +1151,7 @@ static void handle_command(const char *text)
         notify_current_status();
     } else if (strcmp(type, "voice.deactivated") == 0) {
         portENTER_CRITICAL(&s_state_lock);
+        ++s_microphone_generation;
         s_voice_ready = false;
         s_input_suspended = false;
         s_playback_suspended = false;
@@ -886,45 +1165,19 @@ static void handle_command(const char *text)
         notify_current_status();
     } else if (strcmp(type, "audio.begin") == 0) {
         const char *response_id = json_string(message, "responseId");
-        const uint32_t sample_rate = json_number(message, "sampleRate", 24000);
-        if (response_id == NULL) {
-            response_id = "ble-response";
-        }
-        portENTER_CRITICAL(&s_state_lock);
-        s_playback_suspended = true;
-        portEXIT_CRITICAL(&s_state_lock);
-        board_display_set_voice_state("speaking");
-        audio_io_set_capture_enabled(false);
-        esp_err_t error = ESP_ERR_TIMEOUT;
-        if (s_speaker_mutex != NULL
-            && xSemaphoreTake(s_speaker_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            if (s_speaker_response_active) {
-                s_speaker_length = 0;
-            }
-            error = audio_io_begin_response(response_id, sample_rate);
-            if (error == ESP_OK) {
-                s_speaker_response_active = true;
-                flush_speaker_locked(false);
-            }
-            xSemaphoreGive(s_speaker_mutex);
-        }
-        if (error != ESP_OK && error != ESP_ERR_NOT_SUPPORTED) {
+        if (response_id == NULL) response_id = "ble-response";
+        const esp_err_t error = begin_ble_speaker(response_id,
+            json_number(message, "sampleRate", 24000),
+            json_number(message, "flowControl", 0), json_number(message, "streamId", 0));
+        if (error != ESP_OK) {
             ESP_LOGW(TAG, "Unable to begin BLE playback: %s", esp_err_to_name(error));
+            notify_ack("audio.begin", false, "speaker-flow-rejected");
         }
     } else if (strcmp(type, "audio.done") == 0) {
         const char *response_id = json_string(message, "responseId");
-        if (response_id == NULL) {
-            response_id = "ble-response";
-        }
-        if (s_speaker_mutex != NULL
-            && xSemaphoreTake(s_speaker_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            flush_speaker_locked(true);
-            s_speaker_response_active = false;
-            s_speaker_length = 0;
-            xSemaphoreGive(s_speaker_mutex);
-        }
-        (void)audio_io_end_response(response_id);
-        board_display_set_voice_state("idle");
+        if (response_id == NULL) response_id = "ble-response";
+        const esp_err_t error = end_ble_speaker(response_id, json_number(message, "streamId", 0));
+        if (error != ESP_OK) notify_ack("audio.done", false, "speaker-end-rejected");
     } else if (strcmp(type, "playback.clear") == 0) {
         reset_speaker_stream();
         board_display_set_voice_state("idle");
@@ -937,6 +1190,7 @@ static void handle_command(const char *text)
                                      || device_client_is_ready());
     } else if (strcmp(type, "input.suspend") == 0) {
         portENTER_CRITICAL(&s_state_lock);
+        ++s_microphone_generation;
         s_input_suspended = true;
         portEXIT_CRITICAL(&s_state_lock);
         audio_io_set_capture_enabled(false);
@@ -1024,9 +1278,126 @@ static void command_task(void *argument)
 static void status_task(void *argument)
 {
     (void)argument;
+    unsigned ticks = 0;
     while (true) {
-        notify_current_status();
-        vTaskDelay(pdMS_TO_TICKS(3000));
+        const bool periodic_status = ticks++ % 30 == 0;
+        if (periodic_status) notify_current_status();
+        portENTER_CRITICAL(&s_flow_lock);
+        const bool active = s_flow_enabled && s_speaker_flow.active;
+        const bool abort_stream = s_flow_abort_requested;
+        portEXIT_CRITICAL(&s_flow_lock);
+        if (active || periodic_status || abort_stream) notify_speaker_credit();
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+static bool snapshot_microphone_stream(uint16_t *connection_handle, uint32_t *generation)
+{
+    portENTER_CRITICAL(&s_state_lock);
+    *connection_handle = s_connection_handle;
+    *generation = s_microphone_generation;
+    const bool ready = s_connection_handle != BLE_HS_CONN_HANDLE_NONE
+        && s_microphone_notify_enabled && s_voice_ready
+        && !s_input_suspended && !s_playback_suspended;
+    portEXIT_CRITICAL(&s_state_lock);
+    return ready;
+}
+
+static bool microphone_frame_is_current(const ble_audio_frame_t *frame)
+{
+    uint16_t connection_handle;
+    uint32_t generation;
+    return snapshot_microphone_stream(&connection_handle, &generation)
+        && connection_handle == frame->connection_handle && generation == frame->generation;
+}
+
+static void record_microphone_drop(int result, size_t accepted, size_t size)
+{
+    portENTER_CRITICAL(&s_state_lock);
+    const uint32_t dropped = ++s_dropped_microphone_frames;
+    portEXIT_CRITICAL(&s_state_lock);
+    if ((dropped % 20U) == 1U) {
+        ESP_LOGW(TAG, "BLE microphone congestion; dropped frames=%" PRIu32
+                 " rc=%d accepted=%u/%u", dropped, result,
+                 (unsigned)accepted, (unsigned)size);
+    }
+}
+
+static void send_microphone_frame(const ble_audio_frame_t *frame)
+{
+    if (!microphone_frame_is_current(frame)) return;
+    const uint16_t mtu = ble_att_mtu(frame->connection_handle);
+    const size_t chunk_size = mtu > 3 ? mtu - 3 : 20;
+    // Notifications contain mu-law bytes, not PCM16 words. Each successful
+    // notification is an independent contiguous part of the byte stream.
+    TickType_t timeout = pdMS_TO_TICKS(BLE_MIC_NOTIFY_TIMEOUT_MS);
+    if (timeout == 0) timeout = 1;
+    TickType_t frame_timeout = pdMS_TO_TICKS(BLE_MIC_FRAME_TIMEOUT_MS);
+    if (frame_timeout == 0) frame_timeout = 1;
+    const TickType_t frame_started = xTaskGetTickCount();
+    if (s_microphone_needs_reset || s_microphone_sent_generation != frame->generation) {
+        char boundary[80];
+        snprintf(boundary, sizeof(boundary),
+                 "{\"type\":\"microphone.reset\",\"generation\":%" PRIu32 "}", frame->generation);
+        while (true) {
+            if (!microphone_frame_is_current(frame)) return;
+            if (notify_text(boundary)) break;
+            if ((TickType_t)(xTaskGetTickCount() - frame_started) >= timeout) {
+                record_microphone_drop(BLE_HS_ETIMEOUT, 0, frame->size);
+                return;
+            }
+            vTaskDelay(1);
+        }
+        // This task queues the complete reset notification before its PCM on
+        // the same BLE connection. If reset cannot be queued, send no PCM.
+        s_microphone_sent_generation = frame->generation;
+        s_microphone_needs_reset = false;
+    }
+    int last_failure = 0;
+    size_t offset = 0;
+    while (offset < frame->size) {
+        const size_t remaining = frame->size - offset;
+        const size_t length = remaining < chunk_size ? remaining : chunk_size;
+        const TickType_t started = xTaskGetTickCount();
+        int result;
+        while (true) {
+            if (!microphone_frame_is_current(frame)) {
+                s_microphone_needs_reset = true;
+                return;
+            }
+            // Occasional progress must not restart the budget indefinitely,
+            // especially at the default 23-byte MTU with many tiny fragments.
+            if ((TickType_t)(xTaskGetTickCount() - frame_started) >= frame_timeout) {
+                record_microphone_drop(last_failure == 0 ? BLE_HS_ETIMEOUT : last_failure,
+                                       offset, frame->size);
+                s_microphone_needs_reset = true;
+                return;
+            }
+            struct os_mbuf *packet = ble_hs_mbuf_from_flat(frame->data + offset,
+                                                         (uint16_t)length);
+            result = packet == NULL ? BLE_HS_ENOMEM
+                : ble_gatts_notify_custom(frame->connection_handle, s_microphone_handle, packet);
+            // NimBLE consumes packet on both success and error. Retry only the
+            // rejected fragment; bytes already accepted must never be repeated.
+            if (result == 0) break;
+            last_failure = result;
+            const bool retryable = result == BLE_HS_ENOMEM || result == BLE_HS_ENOMEM_EVT
+                || result == BLE_HS_EAGAIN || result == BLE_HS_EBUSY;
+            if (!retryable || (TickType_t)(xTaskGetTickCount() - started) >= timeout
+                || (TickType_t)(xTaskGetTickCount() - frame_started) >= frame_timeout) {
+                if (microphone_frame_is_current(frame)) {
+                    record_microphone_drop(result, offset, frame->size);
+                }
+                s_microphone_needs_reset = true;
+                return;
+            }
+            // At 100 Hz, pdMS_TO_TICKS(1/2) is zero and never lets the BLE
+            // controller drain. A failed fragment must wait at least one tick.
+            // No status-notification mutex is held during this wait.
+            vTaskDelay(1);
+        }
+        offset += length;
+        taskYIELD();
     }
 }
 
@@ -1040,65 +1411,8 @@ static void microphone_task(void *argument)
             continue;
         }
 
-        uint16_t connection_handle;
-        bool microphone_notify_enabled;
-        bool voice_ready;
-        bool input_suspended;
-        snapshot_link_state(&connection_handle, NULL, NULL);
-        snapshot_audio_state(&microphone_notify_enabled,
-                             &voice_ready,
-                             &input_suspended);
-        if (connection_handle == BLE_HS_CONN_HANDLE_NONE
-            || !microphone_notify_enabled
-            || !voice_ready
-            || input_suspended) {
-            free(frame);
-            continue;
-        }
-
-        const uint16_t mtu = ble_att_mtu(connection_handle);
-        size_t chunk_size = mtu > 3 ? mtu - 3 : 20;
-        chunk_size &= ~(sizeof(int16_t) - 1U);
-        if (chunk_size < sizeof(int16_t)) {
-            chunk_size = 20;
-        }
-
-        bool dropped = false;
-        size_t offset = 0;
-        while (offset < frame->size) {
-            const size_t remaining = frame->size - offset;
-            const size_t length = remaining < chunk_size ? remaining : chunk_size;
-            bool sent = false;
-            for (unsigned retry = 0; retry < BLE_NOTIFY_RETRY_COUNT; ++retry) {
-                struct os_mbuf *packet = ble_hs_mbuf_from_flat(frame->data + offset,
-                                                               (uint16_t)length);
-                if (packet != NULL) {
-                    const int result = ble_gatts_notify_custom(connection_handle,
-                                                               s_microphone_handle,
-                                                               packet);
-                    if (result == 0) {
-                        sent = true;
-                        break;
-                    }
-                }
-                vTaskDelay(pdMS_TO_TICKS(2));
-            }
-            if (!sent) {
-                dropped = true;
-                break;
-            }
-            offset += length;
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
+        send_microphone_frame(frame);
         free(frame);
-        if (dropped) {
-            ++s_dropped_microphone_frames;
-            if ((s_dropped_microphone_frames % 20U) == 1U) {
-                ESP_LOGW(TAG,
-                         "BLE microphone congestion; dropped frames=%" PRIu32,
-                         s_dropped_microphone_frames);
-            }
-        }
     }
 }
 
@@ -1120,8 +1434,10 @@ esp_err_t ble_manager_start(void)
     s_microphone_queue = xQueueCreate(BLE_MIC_QUEUE_DEPTH,
                                       sizeof(ble_audio_frame_t *));
     s_speaker_mutex = xSemaphoreCreateMutex();
+    s_notify_mutex = xSemaphoreCreateMutex();
+    s_credit_mutex = xSemaphoreCreateMutex();
     if (s_command_queue == NULL || s_microphone_queue == NULL
-        || s_speaker_mutex == NULL) {
+        || s_speaker_mutex == NULL || s_notify_mutex == NULL || s_credit_mutex == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -1217,6 +1533,7 @@ esp_err_t ble_manager_start_pairing(void)
                blocked_peers,
                (size_t)blocked_peer_count * sizeof(blocked_peers[0]));
     }
+    ++s_microphone_generation;
     s_voice_ready = false;
     s_input_suspended = false;
     s_playback_suspended = false;
@@ -1339,7 +1656,10 @@ bool ble_manager_is_voice_ready(void)
 
 void ble_manager_send_pcm(const uint8_t *data, size_t size)
 {
-    if (!ble_manager_is_voice_ready() || data == NULL || size == 0
+    uint16_t connection_handle;
+    uint32_t generation;
+    if (!snapshot_microphone_stream(&connection_handle, &generation)
+        || data == NULL || size == 0
         || (size % sizeof(int16_t)) != 0 || s_microphone_queue == NULL) {
         return;
     }
@@ -1356,10 +1676,12 @@ void ble_manager_send_pcm(const uint8_t *data, size_t size)
         }
         ble_audio_frame_t *frame = malloc(sizeof(*frame));
         if (frame == NULL) {
-            ++s_dropped_microphone_frames;
+            record_microphone_drop(BLE_HS_ENOMEM, 0, frame_size / sizeof(int16_t));
             return;
         }
         frame->size = (uint16_t)(frame_size / sizeof(int16_t));
+        frame->connection_handle = connection_handle;
+        frame->generation = generation;
         for (size_t index = 0; index < frame->size; ++index) {
             int16_t sample;
             memcpy(&sample,
@@ -1367,9 +1689,13 @@ void ble_manager_send_pcm(const uint8_t *data, size_t size)
                    sizeof(sample));
             frame->data[index] = linear_pcm_to_mulaw(sample);
         }
-        if (xQueueSend(s_microphone_queue, &frame, 0) != pdTRUE) {
+        if (!microphone_frame_is_current(frame)) {
             free(frame);
-            ++s_dropped_microphone_frames;
+            return;
+        }
+        if (xQueueSend(s_microphone_queue, &frame, 0) != pdTRUE) {
+            record_microphone_drop(BLE_HS_EBUSY, 0, frame->size);
+            free(frame);
             return;
         }
         offset += frame_size;
@@ -1411,16 +1737,24 @@ bool ble_manager_allows_voice_interrupt(void)
 void ble_manager_send_playback_event(const char *event_type,
                                      const char *response_id)
 {
-    if (event_type == NULL || response_id == NULL) {
-        return;
-    }
-    if (strcmp(event_type, "playback.ended") == 0
-        || strcmp(event_type, "playback.cancelled") == 0) {
-        portENTER_CRITICAL(&s_state_lock);
-        s_playback_suspended = false;
-        portEXIT_CRITICAL(&s_state_lock);
-        audio_io_set_capture_enabled(ble_manager_is_voice_ready()
-                                     || device_client_is_ready());
+    if (event_type == NULL || response_id == NULL) return;
+    if ((strcmp(event_type, "playback.ended") == 0 || strcmp(event_type, "playback.cancelled") == 0)
+        && s_speaker_mutex != NULL && xSemaphoreTake(s_speaker_mutex, portMAX_DELAY) == pdTRUE) {
+        // Serialize terminal state and microphone/UI restoration with BEGIN.
+        // Audio callbacks run on the playback task, outside its codec locks.
+        portENTER_CRITICAL(&s_flow_lock);
+        const bool current_response = strcmp(response_id, s_flow_response) == 0;
+        portEXIT_CRITICAL(&s_flow_lock);
+        if (current_response && !audio_io_is_playing()) {
+            mark_speaker_terminal(response_id,
+                strcmp(event_type, "playback.ended") == 0 ? "ended" : "cancelled");
+            portENTER_CRITICAL(&s_state_lock);
+            s_playback_suspended = false;
+            portEXIT_CRITICAL(&s_state_lock);
+            audio_io_set_capture_enabled(ble_manager_is_voice_ready() || device_client_is_ready());
+            board_display_set_voice_state("idle");
+        }
+        xSemaphoreGive(s_speaker_mutex);
     }
     char message[192];
     const int length = snprintf(message,
@@ -1430,6 +1764,9 @@ void ble_manager_send_playback_event(const char *event_type,
                                 response_id);
     if (length > 0 && (size_t)length < sizeof(message)) {
         (void)notify_text(message);
+    }
+    if (strcmp(event_type, "playback.ended") == 0 || strcmp(event_type, "playback.cancelled") == 0) {
+        notify_speaker_credit();
     }
 }
 

@@ -3,6 +3,8 @@ set -eu
 
 PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 SOURCE="$PROJECT_DIR/macos/JuffBLE/Sources/main.swift"
+SPEAKER_SOURCE="$PROJECT_DIR/macos/JuffBLE/Sources/SpeakerTransport.swift"
+MICROPHONE_SOURCE="$PROJECT_DIR/macos/JuffBLE/Sources/MicrophoneTransport.swift"
 INFO_PLIST="$PROJECT_DIR/macos/JuffBLE/Info.plist"
 APP="$PROJECT_DIR/macos/build/JuffBLE.app"
 CONTENTS="$APP/Contents"
@@ -21,6 +23,8 @@ XDG_CACHE_HOME="$PROJECT_DIR/macos/build/cache" \
   -framework Foundation \
   -framework CoreBluetooth \
   "$SOURCE" \
+  "$SPEAKER_SOURCE" \
+  "$MICROPHONE_SOURCE" \
   -o "$EXECUTABLE"
 
 /usr/bin/install -m 644 "$INFO_PLIST" "$CONTENTS/Info.plist"

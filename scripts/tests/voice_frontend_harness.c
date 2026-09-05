@@ -13,6 +13,7 @@
 #undef free
 
 enum { LIMIT = 200000, FRAME = 160, INPUT_FRAME = 240, REFERENCE_BASE = 1000 };
+enum { HISTORY_FRAMES = CONFIG_JUFF_BOARD_WAVESHARE_LCD_35 ? 30 : 80 };
 static int chunk_size;
 static int16_t observed_mic[LIMIT], observed_reference[LIMIT];
 static size_t observed_count;
@@ -37,7 +38,13 @@ static struct mock_aec aec;
 static struct mock_vad vad;
 static char last_aec_log[512];
 static unsigned aec_log_count;
+static char last_interrupt_log[512];
+static unsigned interrupt_log_count;
 static bool mutate_aec_inputs;
+static bool override_aec_clean;
+static int16_t forced_aec_clean;
+size_t frontend_test_guard_samples(void);
+bool frontend_test_guard_allows(void);
 
 aec_handle_t *aec_create_from_config(aec_config_t *config)
 {
@@ -59,7 +66,8 @@ void aec_process(const aec_handle_t *handle, int16_t *mic,
         observed_mic[observed_count] = mic[index];
         observed_reference[observed_count++] = reference[index];
         // An ideal subtractor gives known stream values; it is not an AEC model.
-        clean[index] = (int16_t)(mic[index] - reference[index]);
+        clean[index] = override_aec_clean ? forced_aec_clean
+            : (int16_t)(mic[index] - reference[index]);
         // The real AEC accepts writable input. Diagnostics must retain the
         // physical ADC level even if library preprocessing changes buffers.
         if (mutate_aec_inputs) mic[index] = reference[index] = 0;
@@ -99,7 +107,8 @@ void *heap_caps_aligned_alloc(size_t alignment, size_t size, unsigned caps)
 void *heap_caps_malloc(size_t size, unsigned caps)
 {
     assert(caps == (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    assert(size == 4800 * sizeof(int16_t) || size == 8000 * sizeof(int16_t));
+    assert(size == HISTORY_FRAMES * FRAME * sizeof(int16_t)
+        || size == (HISTORY_FRAMES + 20) * FRAME * sizeof(int16_t));
     return allocate(size, caps);
 }
 void frontend_test_free(void *pointer)
@@ -128,6 +137,9 @@ void frontend_test_log(const char *tag, const char *format, ...)
     if (strncmp(message, "Playback AEC:", 13) == 0) {
         memcpy(last_aec_log, message, (size_t)length + 1);
         ++aec_log_count;
+    } else if (strncmp(message, "Voice interruption detected:", 28) == 0) {
+        memcpy(last_interrupt_log, message, (size_t)length + 1);
+        ++interrupt_log_count;
     }
 }
 
@@ -193,9 +205,9 @@ static void prepare_history(void)
 {
     // Let reset recovery elapse before the separate playback warmup.
     feed_frames(50, 0, false, false, true);
-    for (unsigned frame = 0; frame < 65; ++frame) {
-        // Twelve qualified frames (48..59) freeze history at frame 59.
-        vad_result = frame < 48 ? VAD_SILENCE : VAD_SPEECH;
+    for (unsigned frame = 0; frame < HISTORY_FRAMES + 35; ++frame) {
+        // Fill and wrap the complete board-specific history before triggering.
+        vad_result = frame < HISTORY_FRAMES + 18 ? VAD_SILENCE : VAD_SPEECH;
         feed_clean(INPUT_FRAME, 1000 + (int16_t)frame, true, false, true);
     }
     assert(interrupt_calls == 1 && uploaded_count == 0);
@@ -244,6 +256,60 @@ static unsigned telemetry_value(const char *key)
     const unsigned long parsed = strtoul(value + strlen(key), &end, 10);
     assert(end != value + strlen(key) && (*end == ' ' || *end == '\0'));
     return (unsigned)parsed;
+}
+
+static unsigned interrupt_telemetry_value(const char *key)
+{
+    const char *value = strstr(last_interrupt_log, key);
+    assert(value != NULL);
+    char *end = NULL;
+    const unsigned long parsed = strtoul(value + strlen(key), &end, 10);
+    assert(end != value + strlen(key) && (*end == ' ' || *end == '\0'));
+    return (unsigned)parsed;
+}
+
+static void test_interrupt_telemetry(bool varied, bool zero_mic)
+{
+    mutate_aec_inputs = true;
+    const int16_t mic = zero_mic ? 0 : 1000;
+    const int16_t reference = zero_mic ? -800 : 200;
+    // Warm the actual frontend while the fake VAD reports silence. The fake
+    // AEC erases both writable inputs, after computing their known difference.
+    for (unsigned frame = 0; frame < 60; ++frame)
+        feed(INPUT_FRAME, mic, reference, true, false, true);
+    assert(interrupt_calls == 0 && interrupt_log_count == 0);
+    vad_result = VAD_SPEECH;
+    if (varied) {
+        assert(chunk_size == FRAME);
+        // This interrupted candidate must not contaminate the later 120 ms.
+        for (unsigned frame = 0; frame < 3; ++frame)
+            feed(INPUT_FRAME, 1000, 0, true, false, true);
+        vad_result = VAD_SILENCE;
+        feed(INPUT_FRAME, 1000, 0, true, false, true);
+        vad_result = VAD_SPEECH;
+        for (unsigned frame = 0; frame < 6; ++frame)
+            feed(INPUT_FRAME, 800, 400, true, false, true);
+        for (unsigned frame = 0; frame < 5; ++frame)
+            feed(INPUT_FRAME, mic, reference, true, false, true);
+        assert(interrupt_calls == 0 && interrupt_log_count == 0);
+        feed(INPUT_FRAME, mic, reference, true, false, true);
+    } else {
+        // Also cover an actual 512-sample AEC block spanning 10 ms VAD frames.
+        for (unsigned frame = 0; frame < 20; ++frame)
+            feed(INPUT_FRAME, mic, reference, true, false, true);
+    }
+    assert(interrupt_calls == 1 && interrupt_log_count == 1);
+    assert(interrupt_telemetry_value("block_mic=") == (unsigned)mic);
+    assert(interrupt_telemetry_value("block_ref=") == (unsigned)(reference < 0 ? -reference : reference));
+    assert(interrupt_telemetry_value("block_clean=") == 800);
+    assert(interrupt_telemetry_value("candidate_clean_mic_power_min=") == (zero_mic ? 0U : varied ? 250U : 640U));
+    assert(interrupt_telemetry_value("max=") == (zero_mic ? 0U : 640U));
+    assert(interrupt_telemetry_value("scale=") == 1000);
+    assert(interrupt_telemetry_value("frames=") == 12);
+    assert(interrupt_telemetry_value("zero_mic=") == (zero_mic ? 12U : 0U));
+    for (unsigned frame = 0; frame < 20; ++frame)
+        feed(INPUT_FRAME, mic, reference, true, false, true);
+    assert(interrupt_calls == 1 && interrupt_log_count == 1);
 }
 
 static void test_mic_telemetry(void)
@@ -473,16 +539,16 @@ static void test_history(void)
 {
     prepare_history();
     feed_frames(1, 2000, false, true, true);
-    assert(uploaded_count == 4800 && upload_calls == 3);
-    for (unsigned frame = 0; frame < 30; ++frame)
+    assert(uploaded_count == HISTORY_FRAMES * FRAME && upload_calls == HISTORY_FRAMES / 10);
+    for (unsigned frame = 0; frame < HISTORY_FRAMES; ++frame)
         expect_value(frame * FRAME, FRAME, 1030 + (int16_t)frame);
     for (unsigned frame = 1; frame <= 4; ++frame)
         feed_frames(1, 2000 + (int16_t)frame, false, true, true);
-    assert(uploaded_count == 6400 && upload_calls == 4);
+    assert(uploaded_count == (HISTORY_FRAMES + 10) * FRAME && upload_calls == HISTORY_FRAMES / 10 + 1);
     for (unsigned frame = 0; frame < 5; ++frame)
-        expect_value(4800 + frame * FRAME, FRAME, 1060 + (int16_t)frame);
+        expect_value((HISTORY_FRAMES + frame) * FRAME, FRAME, 1030 + HISTORY_FRAMES + (int16_t)frame);
     for (unsigned frame = 0; frame <= 4; ++frame)
-        expect_value(5600 + frame * FRAME, FRAME, 2000 + (int16_t)frame);
+        expect_value((HISTORY_FRAMES + 5 + frame) * FRAME, FRAME, 2000 + (int16_t)frame);
     assert(interrupt_calls == 1);
 }
 
@@ -506,14 +572,14 @@ static void test_full_history(void)
     prepare_history();
     // Waiting longer than the bounded 200 ms pending tail must not consume
     // space indefinitely or drop the first frame once live upload resumes.
-    for (unsigned frame = 65; frame < 100; ++frame)
+    for (unsigned frame = HISTORY_FRAMES + 35; frame < HISTORY_FRAMES + 70; ++frame)
         feed_frames(1, 1000 + (int16_t)frame, true, false, true);
     assert(interrupt_calls == 1 && uploaded_count == 0);
     feed_frames(10, 2000, false, true, true);
-    assert(uploaded_count == 9600 && upload_calls == 6);
-    for (unsigned frame = 0; frame < 50; ++frame)
+    assert(uploaded_count == (HISTORY_FRAMES + 30) * FRAME && upload_calls == HISTORY_FRAMES / 10 + 3);
+    for (unsigned frame = 0; frame < HISTORY_FRAMES + 20; ++frame)
         expect_value(frame * FRAME, FRAME, 1030 + (int16_t)frame);
-    expect_value(8000, 1600, 2000);
+    expect_value((HISTORY_FRAMES + 20) * FRAME, 1600, 2000);
 }
 
 static void test_playing_mute(void)
@@ -568,9 +634,9 @@ static void test_allocation_caps(void)
         else
             internal_bytes += allocations[index].size;
     }
-    assert(external_bytes == 25600);
+    assert(external_bytes == (HISTORY_FRAMES * 2 + 20) * FRAME * sizeof(int16_t));
     assert(internal_bytes == 3 * (size_t)chunk_size * sizeof(int16_t));
-    // Exercise all 8000 pending samples and the retained fixed upload size.
+    // Exercise the full board-specific pending buffer and fixed upload size.
     test_full_history();
 }
 
@@ -592,6 +658,100 @@ static void test_allocation_failure(unsigned failed_attempt)
     expect_value(0, uploaded_count, 2000);
 }
 
+static void test_echo_guard_low(void)
+{
+    vad_result = VAD_SPEECH;
+    mutate_aec_inputs = true;
+    // The clean RMS still exceeds the unchanged 180 floor for well over
+    // 120 ms, but it is only 0.09% of the raw microphone's power.
+    for (unsigned frame = 0; frame < 100; ++frame)
+        feed(INPUT_FRAME, 10000, 9700, true, false, true);
+    assert(interrupt_calls == (CONFIG_JUFF_BOARD_WAVESHARE_LCD_154 ? 0U : 1U));
+    assert(frontend_test_guard_allows() == !CONFIG_JUFF_BOARD_WAVESHARE_LCD_154);
+}
+
+static void test_echo_guard_speech(bool soft, bool quiet)
+{
+    mutate_aec_inputs = true;
+    if (quiet) {
+        // Reference has warmed the existing detector before a pause. A low
+        // clean/raw ratio must not disable nearby speech during that pause.
+        for (unsigned frame = 0; frame < 60; ++frame)
+            feed(INPUT_FRAME, 1000, 1000, true, false, true);
+        override_aec_clean = true;
+        forced_aec_clean = 300;
+    }
+    vad_result = VAD_SPEECH;
+    for (unsigned frame = 0; frame < 100; ++frame)
+        feed(INPUT_FRAME, quiet ? 10000 : soft ? 1800 : 1400,
+             quiet ? 0 : soft ? 1600 : 1000, true, false, true);
+    assert(interrupt_calls == 1 && interrupt_log_count == 1);
+}
+
+static unsigned fill_echo_guard(int16_t mic, int16_t reference)
+{
+    // Feed exactly one entire AEC block at a time, including grouped buckets
+    // for native fixtures whose block size differs from the device's 512.
+    const unsigned blocks_per_bucket = (512U + chunk_size - 1U) / chunk_size;
+    for (unsigned block = 0; block < 4 * blocks_per_bucket; ++block)
+        feed((size_t)chunk_size * 3 / 2, mic, reference, true, false, true);
+    const unsigned samples = 4 * blocks_per_bucket * chunk_size;
+    assert(frontend_test_guard_samples() == (CONFIG_JUFF_BOARD_WAVESHARE_LCD_154 ? samples : 0U));
+    return samples;
+}
+
+static void test_echo_guard_window(void)
+{
+    const int16_t empty[6] = { 0 };
+    assert(frontend_test_guard_samples() == 0 && frontend_test_guard_allows());
+    // A partially filled window never extends the existing warmup or inserts
+    // another time delay. Real detection already has its separate 400 ms gate.
+    feed((size_t)chunk_size * 3 / 2, 10000, 9700, true, false, true);
+    assert(frontend_test_guard_allows());
+    const unsigned samples = fill_echo_guard(10000, 9700);
+    assert(samples >= 2048);
+    assert(frontend_test_guard_allows() == !CONFIG_JUFF_BOARD_WAVESHARE_LCD_154);
+
+    ++playback_generation;
+    process_input(empty, 0, true, false, true);
+    assert(frontend_test_guard_samples() == 0 && frontend_test_guard_allows());
+    fill_echo_guard(10000, 9700);
+    process_input(empty, 0, true, false, false); // Explicit detection mute.
+    assert(frontend_test_guard_samples() == 0 && frontend_test_guard_allows());
+    process_input(empty, 0, true, false, true);
+    assert(frontend_test_guard_samples() == 0);
+    fill_echo_guard(10000, 9700);
+    playback_pcm_started = false;
+    process_input(empty, 0, true, false, true);
+    playback_pcm_started = true;
+    process_input(empty, 0, true, false, true);
+    assert(frontend_test_guard_samples() == 0 && frontend_test_guard_allows());
+    fill_echo_guard(10000, 9700);
+    process_input(empty, 0, false, false, true);
+    assert(frontend_test_guard_samples() == 0 && frontend_test_guard_allows());
+    fill_echo_guard(10000, 9700);
+    voice_frontend_reset_stream();
+    assert(frontend_test_guard_samples() == 0 && frontend_test_guard_allows());
+    assert(interrupt_calls == 0);
+}
+
+static void test_echo_guard_boundary(void)
+{
+    override_aec_clean = true;
+    forced_aec_clean = 100;
+    fill_echo_guard(1000, 80); // Exactly 1% power, reference exactly active.
+    assert(frontend_test_guard_allows());
+    forced_aec_clean = 99;
+    fill_echo_guard(1000, 80);
+    assert(frontend_test_guard_allows() == !CONFIG_JUFF_BOARD_WAVESHARE_LCD_154);
+    fill_echo_guard(1000, 79); // Below the existing reference RMS threshold.
+    assert(frontend_test_guard_allows());
+    forced_aec_clean = INT16_MIN;
+    fill_echo_guard(INT16_MIN, 80); // Worst signed magnitude in both energies.
+    assert(frontend_test_guard_allows());
+    assert(interrupt_calls == 0);
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 3);
@@ -611,6 +771,15 @@ int main(int argc, char **argv)
     else if (strcmp(argv[1], "allocation-caps") == 0) test_allocation_caps();
     else if (strcmp(argv[1], "echo") == 0) test_echo();
     else if (strcmp(argv[1], "mic-telemetry") == 0) test_mic_telemetry();
+    else if (strcmp(argv[1], "interrupt-telemetry") == 0) test_interrupt_telemetry(true, false);
+    else if (strcmp(argv[1], "interrupt-telemetry-block") == 0) test_interrupt_telemetry(false, false);
+    else if (strcmp(argv[1], "interrupt-telemetry-zero") == 0) test_interrupt_telemetry(false, true);
+    else if (strcmp(argv[1], "echo-guard-low") == 0) test_echo_guard_low();
+    else if (strcmp(argv[1], "echo-guard-normal") == 0) test_echo_guard_speech(false, false);
+    else if (strcmp(argv[1], "echo-guard-soft") == 0) test_echo_guard_speech(true, false);
+    else if (strcmp(argv[1], "echo-guard-quiet") == 0) test_echo_guard_speech(false, true);
+    else if (strcmp(argv[1], "echo-guard-window") == 0) test_echo_guard_window();
+    else if (strcmp(argv[1], "echo-guard-boundary") == 0) test_echo_guard_boundary();
     else if (strcmp(argv[1], "gates") == 0) test_gates();
     else if (strcmp(argv[1], "spikes") == 0) test_spikes();
     else if (strcmp(argv[1], "candidate-mute") == 0) test_candidate_mute();

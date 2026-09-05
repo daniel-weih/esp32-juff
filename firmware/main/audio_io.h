@@ -13,6 +13,16 @@ typedef void (*audio_playback_callback_t)(const char *event_type,
                                           void *context);
 typedef bool (*audio_barge_in_callback_t)(void *context);
 
+typedef struct {
+    // Reserved PCM includes queued blocks and the block currently being written.
+    uint32_t queued_bytes;
+    uint32_t capacity_bytes;
+    uint32_t underruns;
+    bool buffering;
+} audio_playback_buffer_status_t;
+
+audio_playback_buffer_status_t audio_io_playback_buffer_status(void);
+
 esp_err_t audio_io_init(audio_pcm_callback_t pcm_callback,
                         audio_playback_callback_t playback_callback,
                         audio_barge_in_callback_t barge_in_callback,
@@ -21,8 +31,14 @@ esp_err_t audio_io_init(audio_pcm_callback_t pcm_callback,
 esp_err_t audio_io_run_self_test(void);
 esp_err_t audio_io_begin_response(const char *response_id, uint32_t sample_rate);
 esp_err_t audio_io_push_pcm(const uint8_t *data, size_t size);
+// Wi-Fi receive backpressure; failure cancels only the original response.
+// Never retarget delayed PCM to a newer response.
+esp_err_t audio_io_push_pcm_wait(const uint8_t *data, size_t size, uint32_t timeout_ms);
 esp_err_t audio_io_end_response(const char *response_id);
 void audio_io_clear(const char *reason);
+// Permanently reject capture/playback until reboot; safe to call repeatedly.
+// PA disable precedes waits; returns an observed driver error or timeout.
+esp_err_t audio_io_shutdown(void);
 void audio_io_set_capture_enabled(bool enabled);
 bool audio_io_is_playing(void);
 bool audio_io_is_available(void);

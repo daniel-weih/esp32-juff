@@ -6,7 +6,7 @@
 | :---: | :---: |
 | <img src="docs/images/juff-ui-3.5.png" alt="JUFF firmware UI for the large display" width="320"> | <img src="docs/images/juff-ui-1.54.png" alt="JUFF firmware UI for the small display" width="240"> |
 
-*Rendered from the current firmware UI at each display's native resolution.*
+*Rendered from the `0.6.10-dev` firmware UI at each display's native resolution; the small display's 78% battery reading is illustrative.*
 
 JUFF turns the Waveshare **ESP32-S3-Touch-LCD-3.5 / 1.54** into a touch-enabled,
 real-time voice terminal. Its default transport is encrypted Bluetooth LE:
@@ -41,13 +41,33 @@ The [validation record](docs/voice-interruption-validation.md) retains failures
 and one calibrated smoke-test pass from `0.6.0-dev`; these results do not
 establish acoustic acceptance.
 Version `0.6.2-dev` introduced the large board's ES8311 digital-reference
-integration. The current development version, `0.6.3-dev`, removes temporary
-display diagnostics. Recovery from the large board's reported black screen
+integration. The current development version is `0.6.10-dev`; temporary
+display diagnostics were removed in `0.6.3-dev`. Recovery from the large board's reported black screen
 has not been confirmed on the physical device; earlier acoustic results do
 not establish display acceptance. See the [large-board AEC record](docs/waveshare-lcd-3.5-aec-feasibility.md).
 
+Version `0.6.8-dev` adds up to four seconds of device audio buffering and BLE
+receiver credits. Playback starts with a 300 ms prefill; excess synthesized audio
+queues on the Mac, and interruption clears pending speech on both sides. Each
+board has a separate firmware package, and the Mac still supports older firmware.
+Version `0.6.10-dev` fixes concurrent credit notification ordering, Wi-Fi buffer
+overflow, and incomplete microphone frames after interruption. The microphone
+boundary fix requires updating both the firmware and the Mac BLE helper.
+
 The visually similar Touch-AMOLED-1.8 has different hardware and is not
 compatible with this firmware.
+
+On the 1.54-inch board, hold **PWR** for about 3 seconds, then release when
+`Release to power off` appears. Press PWR again to turn it on. With USB connected,
+the device enters deep sleep and charging can continue. BOOT still interrupts speech.
+The battery icon keeps its numeric percentage and fill while charging, with a green
+lightning bolt. Levels at 20% or below are red; unavailable readings show `--`.
+Charging transitions do not hide the number. This remains a voltage estimate,
+without remaining-capacity calibration for the installed cell.
+
+<img src="docs/images/juff-ui-1.54-charging.png" alt="JUFF small display charging preview with an illustrative 78% battery reading and green lightning bolt" width="240">
+
+*Small-display charging preview; the large display omits unsupported battery readings.*
 
 ## Set up a new Mac
 

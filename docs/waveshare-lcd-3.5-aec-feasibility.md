@@ -5,7 +5,7 @@ The application integration was introduced in JUFF `0.6.2-dev`.
 
 ## Current status
 
-The current source version is `0.6.3-dev`. It removes temporary black-screen
+The source version examined in this record is `0.6.3-dev`. It removes temporary black-screen
 diagnostics and restores the large board's 80 MHz SPI clock and single LCD
 initialization sequence. It preserves the AEC configuration described below.
 
