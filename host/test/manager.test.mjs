@@ -8,6 +8,7 @@ import test from 'node:test'
 import { ProfileStore, validateProfiles } from '../src/manager/profiles.mjs'
 import { ServiceManager } from '../src/manager/services.mjs'
 import { LogStore, readLines } from '../src/manager/logs.mjs'
+import { AssistantProfileStore } from '../src/manager/assistant.mjs'
 
 async function fixture(t, options = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'juff-manager-'))
@@ -77,6 +78,58 @@ test('concurrent device starts launch one shared gateway and isolated BLE worker
   assert.equal(manager.record('small-ble').state, 'stopped')
   assert.equal(manager.record('large-ble').state, 'running')
   assert.equal(manager.record('gateway').state, 'running')
+})
+
+test('saving assistant settings does not interrupt services; apply recreates only previously running connections', async t => {
+  const { manager, store, children } = await fixture(t)
+  manager.assistantStore = new AssistantProfileStore({ file: path.join(path.dirname(store.file), 'ASSISTANT.md') })
+  await manager.command('large-ble', 'start')
+  const oldGateway = manager.record('gateway').child, oldVoice = manager.record('large-ble').child
+  let profile = await manager.readAssistant()
+  profile = await manager.saveAssistant({ content: '你叫小智。', revision: profile.revision })
+  assert.equal(manager.record('large-ble').child, oldVoice)
+  assert.equal(profile.reconnected, 0)
+  profile = await manager.saveAssistant({ content: '你叫小智，回答简短。', revision: profile.revision, reconnect: true })
+  assert.equal(profile.reconnected, 1)
+  assert.equal(profile.applyError, null)
+  assert.equal(manager.record('gateway').child, oldGateway)
+  assert.notEqual(manager.record('large-ble').child, oldVoice)
+  assert.equal(manager.record('small-ble').state, 'stopped')
+  assert.deepEqual(children.map(item => item.kind), ['gateway', 'ble', 'ble'])
+  assert.ok(!JSON.stringify(manager.snapshot()).includes('你叫小智'))
+})
+
+test('assistant edits serialize stale revisions and reject reconnecting unmanaged gateways', async t => {
+  const { manager, store, external } = await fixture(t)
+  manager.assistantStore = new AssistantProfileStore({ file: path.join(path.dirname(store.file), 'ASSISTANT.md') })
+  const profile = await manager.readAssistant()
+  const results = await Promise.allSettled(['一', '二'].map(content => manager.saveAssistant({ content, revision: profile.revision })))
+  assert.deepEqual(results.map(item => item.status), ['fulfilled', 'rejected'])
+  external.set('3101', true)
+  await manager.refresh()
+  const current = await manager.readAssistant()
+  await assert.rejects(manager.saveAssistant({ content: '外部', revision: current.revision, reconnect: true }), /外部管理/)
+  assert.equal((await manager.readAssistant()).content, '一')
+  manager.env.QWEN_GATEWAY_URL = 'https://gateway.example.invalid'
+  await assert.rejects(manager.readAssistant(), /外部网关/)
+})
+
+test('failed assistant reconnect reports that the profile was saved instead of claiming it applied', async t => {
+  const { manager, store } = await fixture(t)
+  manager.assistantStore = new AssistantProfileStore({ file: path.join(path.dirname(store.file), 'ASSISTANT.md') })
+  await manager.command('large-ble', 'start')
+  const profile = await manager.readAssistant()
+  await manager.command('large-bridge', 'start')
+  const start = manager.start.bind(manager)
+  manager.start = async record => {
+    if (record.kind === 'ble') throw new Error('simulated reconnect failure')
+    return start(record)
+  }
+  const result = await manager.saveAssistant({ content: '已保存的设定', revision: profile.revision, reconnect: true })
+  assert.match(result.applyError, /设定已保存/)
+  assert.equal(result.reconnected, 1)
+  assert.equal(manager.record('large-bridge').state, 'running')
+  assert.equal((await manager.readAssistant()).content, '已保存的设定')
 })
 
 test('gateway restart preserves only active dependents; stop orders children before gateway', async t => {

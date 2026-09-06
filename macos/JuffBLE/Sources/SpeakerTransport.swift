@@ -164,8 +164,13 @@ final class SpeakerTransport {
         if let chunk = response.chunks.first {
             guard canSendAudio else { return nil }
             let header = response.flow ? Self.headerBytes : 0
-            guard maximumPacketBytes > header else { return nil }
-            var count = min(maximumPacketBytes - header, chunk.count - response.offset)
+            // JUFF requests 251-byte link payloads. A GATT write also needs
+            // 4 L2CAP + 3 ATT bytes, so a 253-byte value (ATT MTU 256) spills
+            // into a second radio packet. Keep v1 audio in one link packet;
+            // CoreBluetooth readiness and device credits still set the rate.
+            let packetBytes = response.flow ? min(maximumPacketBytes, 244) : maximumPacketBytes
+            guard packetBytes > header else { return nil }
+            var count = min(packetBytes - header, chunk.count - response.offset)
             if response.flow {
                 guard response.haveCredit, response.limit > response.sent else { return nil }
                 count = min(count, Int(response.limit - response.sent))

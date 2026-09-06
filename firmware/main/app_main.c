@@ -19,12 +19,15 @@
 #include "sdkconfig.h"
 #include "usb_provisioning.h"
 #include "wifi_manager.h"
+#include "voice_session.h"
+#include "wake_word.h"
 
 static const char *TAG = "juff";
 
 static void microphone_pcm(const uint8_t *data, size_t size, void *context)
 {
     (void)context;
+    if (!voice_session_can_stream()) return;
     if (ble_manager_is_voice_active()) {
         ble_manager_send_pcm(data, size);
     } else {
@@ -37,6 +40,7 @@ static void playback_event(const char *event_type,
                            void *context)
 {
     (void)context;
+    if (voice_session_can_stream()) voice_session_activity();
     if (ble_manager_audio_is_connected()) {
         ble_manager_send_playback_event(event_type, response_id);
     } else {
@@ -56,6 +60,7 @@ static void send_interrupt(void)
 static bool voice_interrupt_allowed(void *context)
 {
     (void)context;
+    if (!voice_session_can_stream()) return false;
     return ble_manager_is_voice_active()
         ? ble_manager_allows_voice_interrupt()
         : device_client_allows_voice_interrupt();
@@ -144,6 +149,8 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(error);
 
+    ESP_ERROR_CHECK(voice_session_init());
+
     error = audio_io_init(microphone_pcm, playback_event,
                           voice_interrupt, voice_interrupt_allowed, NULL);
     if (error != ESP_OK) {
@@ -160,7 +167,6 @@ void app_main(void)
     }
     // Reserve the LCD's contiguous DMA buffers before starting another task.
     ESP_ERROR_CHECK_WITHOUT_ABORT(battery_monitor_init());
-
 #if CONFIG_JUFF_AUDIO_STARTUP_SELF_TEST
     if (error == ESP_OK && !wifi_manager_has_credentials()) {
         board_display_set_notice("A quick sound check",
@@ -195,6 +201,9 @@ void app_main(void)
     }
 
     error = wifi_manager_start();
+    // Reserve LCD DMA, radio memory and transport task stacks before the model.
+    ESP_ERROR_CHECK(voice_session_start());
+    if (audio_io_is_available()) ESP_ERROR_CHECK_WITHOUT_ABORT(wake_word_init());
     // Start after radio initialization so shutdown never races their startup.
     ESP_ERROR_CHECK_WITHOUT_ABORT(power_manager_start());
     if (error != ESP_OK) {

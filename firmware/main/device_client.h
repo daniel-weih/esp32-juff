@@ -1,5 +1,8 @@
 #pragma once
 
+void device_client_reset_conversation(void);
+void device_client_send_conversation_state(void);
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>

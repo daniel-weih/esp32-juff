@@ -7,10 +7,137 @@ self-interruptions, missed near-end speech and startup failure remain part of
 the record. `0.6.1-dev` changes the UI only and does not add acoustic validation.
 
 Repository defaults disable `CONFIG_JUFF_VOICE_BARGE_IN` for both boards. It
-can be explicitly enabled for the 1.54-inch profile as described in the
+can be explicitly enabled for either hardware profile as described in the
 [firmware guide](../firmware/README.md). A package's `manifest.json` records its
 actual setting in `features.voice_interrupt`; a version number alone does not
 identify whether the experiment is enabled.
+
+## Wake-mode interruption regression
+
+During `0.7.0-dev` testing, normal replies on the small board repeatedly stopped
+after local interrupt events while audio remained buffered. A controlled replay
+of a 24-second synthesized speech excerpt, following the wake acknowledgement,
+also stopped at 19.035 seconds without an added near-end source. Its terminal
+credit reported no playback underruns or dropped speaker bytes.
+
+The echo guard was checked only after the 120 ms speech candidate had already
+accumulated. Frames rejected as echo could therefore pre-fill the candidate,
+and a brief change in the guard's energy window could immediately release it.
+The corrected detector resets the candidate whenever any qualification fails,
+including the echo guard.
+A regression test fails on the old implementation at AEC chunk sizes 160, 256
+and 512 and passes after the correction.
+
+With the first counter correction, the same 24-second excerpt completed twice
+at source gain 1.0. Four
+independent synthetic interruptions, started 1 or 4 seconds into playback,
+produced stop events 894–944 ms after launching the external audio player and
+resumed microphone delivery. The two earlier insertions overlapped active
+speaker reference (192 and 232 RMS across the guard window), rather than only
+testing a pause. All these streams retained zero underruns and dropped bytes.
+These timings use process launch, not measured acoustic onset; the room setup
+and synthetic sources do not establish a general false-positive rate.
+
+A longer 69.69-second fixture exposed a remaining weakness: it still stopped
+around audio position 53 seconds, including a replay with zero underruns. The
+accepted AEC window retained only 1.1% of raw microphone power. A later repeat
+still stopped at 67.588 seconds: a quiet raw MIC made the retained-power ratio
+look strong beside an active reference. The final candidate therefore requires
+360 ms of continuous evidence when retained power is 1–5% of MIC power or less
+than 25% of reference power, while speaker reference is active. Stronger speech
+and reference pauses retain 120 ms. The fast path requires its own consecutive strong frames;
+the longer path preserves continuously qualified speech across strength changes.
+The 1% rejection floor, absolute RMS floor, AEC/NLP settings and large-board
+policy remain unchanged. Weak sustained speech remains eligible for detection.
+
+Long playback also exposed a separate transport problem. One 69.69-second
+local replay completed without an interrupt but took 80.718 seconds with 32
+buffer underruns. Before starvation began, a new encryption event re-requested
+connection parameters and the interval changed from 15 to 13.75 ms. The previous
+7.5–15 ms request range was below Apple's documented minimum. The firmware now
+requests min=max=15 ms and logs rejected updates as well as the actual interval.
+The central still chooses the final parameters; a shorter interval does not
+establish higher application throughput. See
+[Apple's connection parameter guidance](https://developer.apple.com/forums/thread/822187).
+
+The Mac helper also declares a finite latency-critical I/O activity while a
+response is queued or playing, and releases it at completion, cancellation or
+disconnection. This protects remote audio from discretionary background
+throttling; App Nap was not established as the cause of the measured starvation.
+
+The final small-board candidate (application SHA-256 prefix
+`2a10a29abee3c7e2`) was installed while preserving the saved WAKE mode and pairing.
+Controlled checks on that binary include:
+
+| Case | Observation |
+| --- | --- |
+| Production host, cached wake cue and a local simulated gateway streaming the 69.69-second fixture | Exactly one wake cue; speech ended after 69.729 seconds; no local interrupt, underrun or dropped speaker bytes |
+| Two consecutive local replays of the same 69.69-second fixture after a wake cue | Both ended after 69.734 seconds; no local interrupt, underrun or dropped bytes; peak device queue 3.94–3.95 seconds |
+| Two normal-level independent synthetic interruptions during active speaker reference | Local events after 926 and 908 ms; playback cancelled after 938 and 922 ms; microphone delivery resumed; no underruns or dropped bytes |
+| Two quieter independent synthetic interruptions during active speaker reference | Local events after 913 and 932 ms; playback cancelled after 914 and 933 ms; microphone delivery resumed; no underruns or dropped bytes |
+
+The simulated gateway produced 400 ms audio chunks every 100 ms, including one
+400 ms source gap. It used the production conversation client, native BLE helper
+and device firmware, but made no cloud requests. Microphone packets received by
+the local gateway were discarded immediately. Near-end calibration measured
+1447 RMS for normal level and 778 for quieter speech at the loudest 100 ms
+microphone frame; event times start at external player launch. Earlier quieter
+misses and late stops remain in the record below; these limited trials do not
+establish general reliability. A cold-start synthetic wake was also missed
+once before playback began; wake recognition accuracy is a separate open limit.
+
+Speech preservation was an acceptance gap in those four trials. Offline
+Whisper recognized the complete fixed phrase in the silent-robot calibration. After normalizing
+simplified/traditional characters, greedy decoding recovered both parts of the
+phrase in two of the four interrupted clips; one quieter clip lacked the
+opening, and one normal-level clip produced unrelated text. A five-beam decode
+did not consistently recover the missing material and made one previously
+recognized quieter clip worse. These results do not by themselves distinguish
+AEC distortion from ASR error. They establish that four successful stop events
+must not be presented as four reliably recognized follow-up utterances.
+
+### Subsequent two-board acceptance check
+
+On 2026-09-07, both installed `0.7.0-dev` devices were checked again with the
+same fixed near-end phrase and the updated Mac speaker packet sizing. The
+1.54-inch board stayed in LIVE and the 3.5-inch board in WAKE. Each board ran
+two normal-level and two quieter interruptions, with the source launched one
+or four seconds after playback began. The one-second insertions overlapped
+active reference; later insertions also covered reference pauses.
+
+All eight cases stopped playback, resumed microphone delivery and retained
+both parts of “等一下，换个话题” in an unprompted, offline Whisper decode of
+the received 16 kHz microphone PCM, after normalizing traditional characters.
+Robot-silent calibration clips also retained both parts. Normal calibration
+peaks were 1270–1331 RMS per 100 ms; quieter peaks were 697–713. Stop events
+arrived 864–947 ms after starting the external player, not measured acoustic
+onset. Every interrupted stream and the following fresh reply added zero
+underruns and zero dropped speaker bytes.
+
+Both boards also completed a 69.69-second robot-only response without a local
+interrupt or new underrun/drop: 69.731 seconds on the small board and 69.716
+seconds on the large board. These runs used 15 ms BLE intervals. A separate
+earlier 30 ms run had 20 underruns and triggered further transport validation;
+the same 69.69-second fixture subsequently completed at an actual 30 ms
+interval in 69.733 seconds with zero underruns/drops and a 3.9-second peak
+queue. That check used the 244-byte GATT write cap, the unchanged audio codec
+and a temporary firmware connection request covering 15–30 ms. The exact
+original application was restored after the check; production still requests
+15 ms and the central chooses the actual interval.
+
+A forced 45 ms pressure test remained below the stream's required throughput:
+about 8.6 KB/s of received encoded audio against 24 KB/s needed for real-time
+24 kHz μ-law. Repeated buffer underruns prevented completion before the
+deadline. This is a documented link-capacity boundary, not a passing acoustic
+test. The packet change does not promise continuous real-time playback on a link with
+insufficient sustained throughput; a finite buffer cannot compensate for
+that condition indefinitely.
+
+These controlled repetitions close the short-phrase check for this setup.
+They do not erase the earlier failed clips or establish human speech accuracy,
+distance, long-term false-interruption rate, or reliability at every BLE rate.
+Recordings and transcripts remain ignored local artifacts; no cloud request
+was made by these checks.
 
 ## Buffered playback regression investigation
 
@@ -61,8 +188,8 @@ device PCM measurements, not sound-pressure or distance measurements. Stop
 events in the quieter test arrived about 2.55 s and 0.91 s after launching the
 independent playback process; process launch is not measured acoustic onset.
 The earlier diagnostic firmware also responded late in the quieter first
-round. This remains an acceptance gap: a stop event alone does not establish
-usable recovered speech. The results above do not establish long-term,
+round. That trial did not meet speech-preservation acceptance: a stop event
+alone does not establish usable recovered speech. The results above do not establish long-term,
 far-distance or real-user reliability. Test microphone recordings and ASR
 outputs remain local ignored artifacts; none were uploaded for transcription.
 

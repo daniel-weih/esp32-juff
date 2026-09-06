@@ -1,4 +1,5 @@
 #include "ble_manager.h"
+#include "voice_session.h"
 
 #include <inttypes.h>
 #include <stdint.h>
@@ -13,6 +14,7 @@
 #include "board_display.h"
 #include "cJSON.h"
 #include "device_client.h"
+#include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
@@ -127,7 +129,9 @@ static bool s_started;
 static char s_device_name[16] = "JUFF";
 static char s_incoming[BLE_MESSAGE_MAX_BYTES + 1];
 static size_t s_incoming_length;
-static uint8_t s_speaker_buffer[BLE_SPEAKER_BUFFER_BYTES];
+// Packet assembly is CPU-only; the audio driver owns separate DMA buffers.
+// Keep these 19.2 KB out of the SRAM needed by radio/task allocations.
+static EXT_RAM_BSS_ATTR uint8_t s_speaker_buffer[BLE_SPEAKER_BUFFER_BYTES];
 static size_t s_speaker_length;
 static uint32_t s_dropped_microphone_frames;
 static uint32_t s_dropped_speaker_bytes;
@@ -315,6 +319,7 @@ static void mark_connected(uint16_t connection_handle)
 
 static size_t build_status(char *buffer, size_t buffer_size)
 {
+    const voice_session_status_t conversation = voice_session_get();
     const battery_status_t battery = battery_monitor_get();
     char battery_json[128] = "";
     if (battery.supported) {
@@ -340,7 +345,8 @@ static size_t build_status(char *buffer, size_t buffer_size)
         buffer_size,
         "{\"type\":\"status\",\"name\":\"%s\",\"firmware\":\"%s\",\"board\":\"%s\","
         "\"wifiConfigured\":%s,\"wifi\":%s,\"ble\":%s,\"pairing\":%s,\"bridge\":%s,"
-        "\"voice\":%s,\"bleAudio\":%s,\"audio\":%s,\"playing\":%s,\"voiceInterrupt\":%s,\"speakerFlow\":1,\"phyTx\":%u,\"phyRx\":%u%s}",
+        "\"voice\":%s,\"bleAudio\":%s,\"audio\":%s,\"playing\":%s,\"voiceInterrupt\":%s,\"speakerFlow\":1,\"phyTx\":%u,\"phyRx\":%u%s,"
+        "\"voiceMode\":\"%s\",\"conversationActive\":%s,\"wakeWord\":%s}",
         s_device_name,
         esp_app_get_description()->version,
         JUFF_BOARD_ID,
@@ -354,7 +360,9 @@ static size_t build_status(char *buffer, size_t buffer_size)
         audio_io_is_available() ? "true" : "false",
         audio_io_is_playing() ? "true" : "false",
         audio_io_supports_voice_barge_in() ? "true" : "false",
-        (unsigned)s_phy_tx, (unsigned)s_phy_rx, battery_json);
+        (unsigned)s_phy_tx, (unsigned)s_phy_rx, battery_json,
+        voice_session_mode_name(conversation.mode), conversation.active ? "true" : "false",
+        conversation.supported ? "true" : "false");
     if (length < 0 || (size_t)length >= buffer_size) {
         return 0;
     }
@@ -878,7 +886,11 @@ static void display_passkey(uint16_t connection_handle)
 static void configure_audio_link(uint16_t connection_handle)
 {
     const struct ble_gap_upd_params parameters = {
-        .itvl_min = 6,
+        // Apple's audio central expects a minimum interval of 15 ms. The old
+        // 7.5–15 ms range also admitted 13.75 ms after renegotiation, observed
+        // alongside sustained playback starvation. Request the supported
+        // 15 ms interval; the central still chooses the final link parameters.
+        .itvl_min = 12,
         .itvl_max = 12,
         .latency = 0,
         .supervision_timeout = 600,
@@ -1051,8 +1063,11 @@ static int gap_event(struct ble_gap_event *event, void *argument)
 
     case BLE_GAP_EVENT_CONN_UPDATE: {
         struct ble_gap_conn_desc description;
-        if (event->conn_update.status == 0 &&
-            ble_gap_conn_find(event->conn_update.conn_handle, &description) == 0) {
+        if (event->conn_update.status != 0) {
+            ESP_LOGW(TAG, "BLE connection parameter update rejected: %d",
+                     event->conn_update.status);
+        }
+        if (ble_gap_conn_find(event->conn_update.conn_handle, &description) == 0) {
             ESP_LOGI(TAG, "BLE connection interval: %u x 1.25ms, latency=%u",
                      (unsigned)description.conn_itvl, (unsigned)description.conn_latency);
         }
@@ -1121,8 +1136,12 @@ static void handle_command(const char *text)
         return;
     }
 
+    if (!voice_session_handle_control(message)) {
+        cJSON_Delete(message);
+        return;
+    }
     if (strcmp(type, "status") == 0) {
-        notify_current_status();
+        ble_manager_send_conversation_state();
         notify_speaker_credit();
     } else if (strcmp(type, "device.ready") == 0) {
         ESP_LOGI(TAG,
@@ -1293,6 +1312,7 @@ static void status_task(void *argument)
 
 static bool snapshot_microphone_stream(uint16_t *connection_handle, uint32_t *generation)
 {
+    if (!voice_session_can_stream()) return false;
     portENTER_CRITICAL(&s_state_lock);
     *connection_handle = s_connection_handle;
     *generation = s_microphone_generation;
@@ -1712,6 +1732,28 @@ void ble_manager_send_interrupt(void)
     audio_io_set_capture_enabled(ble_manager_is_voice_ready()
                                  || device_client_is_ready());
     (void)notify_text("{\"type\":\"interrupt\"}");
+}
+
+void ble_manager_reset_conversation(void)
+{
+    reset_speaker_stream();
+    portENTER_CRITICAL(&s_state_lock);
+    ++s_microphone_generation;
+    s_voice_ready = false;
+    s_input_suspended = false;
+    s_playback_suspended = false;
+    portEXIT_CRITICAL(&s_state_lock);
+}
+
+void ble_manager_send_conversation_state(void)
+{
+    const voice_session_status_t state = voice_session_get();
+    char message[160];
+    snprintf(message, sizeof(message), "{\"type\":\"conversation.state\",\"mode\":\"%s\","
+             "\"active\":%s,\"generation\":%" PRIu32 "}", voice_session_mode_name(state.mode),
+             state.active ? "true" : "false", state.generation);
+    (void)notify_text(message);
+    notify_current_status();
 }
 
 bool ble_manager_try_voice_interrupt(void)

@@ -58,6 +58,9 @@ class MacOSSpeakerFlowTest(unittest.TestCase):
     def test_stale_audio_is_ignored_but_current_queue_overflow_is_fatal(self):
         self.run_case("overflow")
 
+    def test_audio_fits_one_link_packet_without_gaps_or_credit_overrun(self):
+        self.run_case("link-packet")
+
 
 if __name__ == "__main__":
     unittest.main()

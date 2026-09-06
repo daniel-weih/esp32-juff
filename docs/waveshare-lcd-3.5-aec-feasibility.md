@@ -5,22 +5,38 @@ The application integration was introduced in JUFF `0.6.2-dev`.
 
 ## Current status
 
-The source version examined in this record is `0.6.3-dev`. It removes temporary black-screen
+The physical large board now runs `0.7.0-dev`, including its separate offline
+wake model and ES8311 AEC path. Its saved pairing was retained. Installation
+and subsequent USB boot logs show the first LVGL transfer and FT6336 touch
+initialization. Paired BLE, the local speaker/microphone self-test, a synthetic
+wake and its local acknowledgement were verified. The acknowledgement completed
+without new underruns or dropped speaker bytes. See the [wake-mode record](voice-wake.md)
+for current checks, including subsequent speaker failure recovery.
+
+The first-frame and touch messages establish successful driver operations;
+they do not constitute a new visual inspection of the physical screen.
+Acoustic interruption quality also needs its own acceptance checks. Keep these
+limits separate from the older diagnostic results below.
+
+## Historical display investigation (`0.6.3-dev`)
+
+The source version examined at that stage was `0.6.3-dev`. It removed temporary black-screen
 diagnostics and restores the large board's 80 MHz SPI clock and single LCD
 initialization sequence. It preserves the AEC configuration described below.
 
 After the acoustic runs, a black screen was reported on the large device.
 Temporary images also labelled `0.6.2-dev` added a 1 MHz SPI clock, LCD readback,
 repeated resets, and backlight/power-register logging. Successful driver calls
-and register logs did not confirm a visible image. Display recovery has not
-been confirmed on the physical device; removing diagnostics is not a verified
+and register logs did not confirm a visible image. Display recovery had not
+been confirmed at that stage; removing diagnostics alone was not a verified
 black-screen fix.
 
 The measurements below apply to the earlier AEC candidate, whose boot-reported
 ELF SHA-256 prefix was `7ae28ef84`, with the 80 MHz display configuration.
 They do not validate the later diagnostic images or the `0.6.3-dev` rebuilds.
-The cleanup does not install firmware; it leaves the connected device on its
-last diagnostic image. Packages are generated separately for each board and
+That cleanup did not install firmware and left the device on its diagnostic
+image at the time; the later `0.7.0-dev` installation supersedes that state.
+Packages are generated separately for each board and
 version; use their manifest checksums to identify the actual binary.
 
 Both board profiles were rebuilt and packaged as `0.6.3-dev` with their saved

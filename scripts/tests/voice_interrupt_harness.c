@@ -94,7 +94,8 @@ static void vTaskDelay(unsigned ticks) { (void)ticks; }
 static void esp_restart(void) {}
 
 // The JSON parser boundary returns these already-decoded command fields.
-typedef struct { const char *type; const char *name; } cJSON;
+typedef struct cJSON { const char *type; const char *name; } cJSON;
+#include "voice_session_stubs.h"
 static cJSON *cJSON_Parse(const char *input) { return (cJSON *)input; }
 static void cJSON_Delete(cJSON *value) { (void)value; }
 static const char *json_string(const cJSON *message, const char *key)
@@ -107,6 +108,7 @@ static uint32_t json_number(const cJSON *message, const char *key, uint32_t fall
 { return fallback; }
 static void notify_ack(const char *request, bool ok, const char *error) {}
 static void notify_current_status(void) {}
+void ble_manager_send_conversation_state(void) {}
 static bool notify_text(const char *text)
 {
     if (strcmp(text, "{\"type\":\"interrupt\"}") == 0) ++ble_interrupts;

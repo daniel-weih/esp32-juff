@@ -19,6 +19,7 @@ class AudioShutdownTest(unittest.TestCase):
         cls.temporary = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.temporary.cleanup)
         output = Path(cls.temporary.name)
+        (output / "esp_err.h").write_text("#pragma once\ntypedef int esp_err_t;\n")
         source = (ROOT / "firmware/main/audio_io.c").read_text()
         write_playback_declarations(output, source, (ROOT / "firmware/main/audio_io.h").read_text())
         names = ("free_item", "enqueue_item", "codec_status", "set_amplifier_enabled",

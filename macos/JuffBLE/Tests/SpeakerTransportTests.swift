@@ -96,8 +96,8 @@ private func windowAndBackpressure() {
     precondition(flow.pacingDelay(maximumPacketBytes: 20, now: 0) == nil)
     let (wide, wideStream, _) = open(bytes: Data(repeating: 7, count: 1000))
     precondition(credit(wide, wideStream, received: 0, limit: 1000) == .accepted)
-    precondition(audio(next(wide, maximum: 512)).count == 512)
-    precondition(integer(audio(next(wide, maximum: 512)), 4) == 504)
+    precondition(audio(next(wide, maximum: 512)).count == 244)
+    precondition(integer(audio(next(wide, maximum: 512)), 4) == 236)
 }
 
 private func orderedResponsesAndEndFence() {
@@ -262,6 +262,31 @@ private func staleVersusOverflow() {
     precondition(flow.queuedBytes == 1 && control(next(flow)).token.kind == .begin)
 }
 
+private func singleLinkPacketAudio() {
+    // A 256-byte ATT MTU permits a 253-byte GATT value, but that value needs
+    // two 251-byte link packets after the L2CAP and ATT headers are included.
+    for maximum in [20, 182, 244, 253, 512] {
+        let input = Data((0..<2003).map { UInt8(truncatingIfNeeded: $0) })
+        let (flow, stream, _) = open(bytes: input)
+        precondition(credit(flow, stream, received: 0, limit: 997) == .accepted)
+        var rebuilt = Data()
+        for limit in [997, input.count] {
+            while let action = next(flow, maximum: maximum) {
+                let packet = audio(action)
+                precondition(packet.count <= maximum && packet.count + 4 + 3 <= 251)
+                precondition(integer(packet, 0) == stream)
+                precondition(integer(packet, 4) == UInt32(rebuilt.count))
+                rebuilt.append(packet.dropFirst(8))
+            }
+            precondition(rebuilt.count == limit)
+            precondition(credit(flow, stream, received: UInt32(limit),
+                                limit: UInt32(input.count)) == .accepted)
+        }
+        precondition(rebuilt == input && flow.queuedBytes == 0)
+        precondition(flow.pacingDelay(maximumPacketBytes: maximum, now: 0) == nil)
+    }
+}
+
 @main
 private enum SpeakerTransportTests {
     static func main() {
@@ -275,6 +300,7 @@ private enum SpeakerTransportTests {
         case "timeout": timeoutAndLostEvents()
         case "limits": queueLimitsAndLegacyEnd()
         case "overflow": staleVersusOverflow()
+        case "link-packet": singleLinkPacketAudio()
         default: fatalError("Unknown scenario")
         }
         print("Speaker transport regression passed")

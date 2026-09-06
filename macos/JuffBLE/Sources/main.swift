@@ -24,6 +24,7 @@ private let allowedControlTypes: Set<String> = [
     "input.suspend",
     "input.resume",
     "voice.state",
+    "conversation.ack",
     "error",
 ]
 
@@ -43,6 +44,13 @@ private func protocolUInt32(_ value: Any?) -> UInt32? {
     guard value.isFinite, value >= 0, value <= Double(UInt32.max),
           value.rounded(.towardZero) == value else { return nil }
     return UInt32(value)
+}
+
+private func isNewConversationGeneration(_ candidate: UInt32, after previous: UInt32?) -> Bool {
+    guard candidate != 0 else { return false }
+    guard let previous else { return true }
+    let distance = candidate &- previous
+    return distance != 0 && distance < 0x8000_0000
 }
 
 private func normalizedMessage(_ line: String) -> Data? {
@@ -130,6 +138,14 @@ private func muLawToLinearPCM(_ encoded: Data) -> Data {
 }
 
 private func runSelfTest() -> Bool {
+    guard isNewConversationGeneration(1, after: nil),
+          isNewConversationGeneration(1, after: UInt32.max),
+          !isNewConversationGeneration(UInt32.max, after: 1),
+          !isNewConversationGeneration(7, after: 7),
+          !isNewConversationGeneration(0, after: nil) else {
+        emit("SELFTEST failed:conversation-generation")
+        return false
+    }
     guard protocolUInt32(NSNumber(value: UInt32.max)) == UInt32.max,
           protocolUInt32(NSNumber(value: true)) == nil,
           protocolUInt32(NSNumber(value: -1)) == nil,
@@ -197,13 +213,16 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
     private var activeMessage: ControlWrite?
     private var pendingChunks: [Data] = []
     private let speakerTransport = SpeakerTransport()
+    private var lastSpeakerWriteMaximum = 0
     private var speakerPacingWorkItem: DispatchWorkItem?
     private var speakerWatchdogWorkItem: DispatchWorkItem?
+    private var speakerActivity: NSObjectProtocol?
     private var readyToWrite = false
     private var writeInProgress = false
     private var controlWriteStartedAt = 0.0
     private var statusNotifying = false
     private var microphoneNotifying = false
+    private var conversationGeneration: UInt32?
     private var notificationBuffer = ""
     private let microphoneTransport = MicrophoneTransport()
     private var lastState = ""
@@ -221,6 +240,7 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
     }
 
     func receive(line: String) {
+        defer { updateSpeakerActivity() }
         let source = line.trimmingCharacters(in: .whitespacesAndNewlines)
         if let input = source.data(using: .utf8),
            let object = try? JSONSerialization.jsonObject(with: input),
@@ -290,6 +310,7 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
             return
         }
         stopping = true
+        updateSpeakerActivity()
         retryWorkItem?.cancel()
         speakerPacingWorkItem?.cancel()
         speakerPacingWorkItem = nil
@@ -313,6 +334,22 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
         }
     }
 
+    private func updateSpeakerActivity() {
+        // BLE playback uses no local audio device, so declare its real-time
+        // I/O explicitly while queued audio is still being played remotely.
+        // Release the activity in standby and still permit system sleep.
+        let active = !stopping && readyToWrite && manager.state == .poweredOn
+            && speakerTransport.hasPendingResponse
+        if active && speakerActivity == nil {
+            speakerActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+                reason: "Playing audio on the JUFF device")
+        } else if !active, let activity = speakerActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            speakerActivity = nil
+        }
+    }
+
     private func startScanning(after delay: TimeInterval = 0) {
         retryWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
@@ -330,6 +367,7 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
             self.microphoneNotifying = false
             self.pendingChunks.removeAll()
             self.speakerTransport.resetConnection()
+            self.updateSpeakerActivity()
             self.queuedMessages.removeAll { $0.token != nil || $0.type == "voice.state" }
             self.cancelSpeakerPacing()
             self.speakerWatchdogWorkItem?.cancel()
@@ -429,6 +467,7 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
     }
 
     private func failSpeakerStream(_ reason: String) {
+        defer { updateSpeakerActivity() }
         speakerTransport.clear()
         cancelSpeakerPacing()
         queuedMessages.removeAll { $0.token != nil || $0.type == "voice.state"
@@ -436,7 +475,10 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
         if let status = normalizedMessage("{\"type\":\"status\"}") {
             queuedMessages.insert(ControlWrite(data: status, type: "status"), at: 0)
         }
-        if let clear = normalizedMessage("{\"type\":\"playback.clear\",\"reason\":\"speaker-flow-failed\"}") {
+        // Local recovery bypasses the host's event tagging. Keep it scoped to
+        // the current conversation; older firmware has no generation to add.
+        let generation = conversationGeneration.map { ",\"conversationGeneration\":\($0)" } ?? ""
+        if let clear = normalizedMessage("{\"type\":\"playback.clear\",\"reason\":\"speaker-flow-failed\"\(generation)}") {
             queuedMessages.insert(ControlWrite(data: clear, type: "playback.clear"), at: 0)
         }
         report(reason, repeatable: true)
@@ -468,6 +510,7 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
     }
 
     private func drainSpeakerWrites() {
+        updateSpeakerActivity()
         guard readyToWrite,
               let peripheral,
               let speakerCharacteristic else {
@@ -483,6 +526,10 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
             20,
             peripheral.maximumWriteValueLength(for: .withoutResponse)
         )
+        if maximumLength != lastSpeakerWriteMaximum {
+            lastSpeakerWriteMaximum = maximumLength
+            report("speaker-link:maximum-write-bytes=\(maximumLength)", repeatable: true)
+        }
         while let action = speakerTransport.nextAction(
             maximumPacketBytes: maximumLength,
             canSendAudio: peripheral.canSendWriteWithoutResponse,
@@ -511,11 +558,19 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
     }
 
     private func handleDeviceLine(_ line: String) {
+        defer { updateSpeakerActivity() }
         emit("DEVICE " + line)
         guard let data = line.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = object["type"] as? String else { return }
-        if type == "microphone.reset" {
+        if type == "conversation.state", let generation = protocolUInt32(object["generation"]),
+           isNewConversationGeneration(generation, after: conversationGeneration) {
+            conversationGeneration = generation
+            microphoneTransport.reset()
+            speakerTransport.clear()
+            cancelSpeakerPacing()
+            queuedMessages.removeAll { $0.token != nil || $0.type == "voice.state" }
+        } else if type == "microphone.reset" {
             microphoneTransport.reset()
         } else if type == "status" {
             speakerTransport.setCapability(protocolUInt32(object["speakerFlow"]) == 1)
@@ -558,6 +613,8 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
             return
         }
         readyToWrite = true
+        conversationGeneration = nil
+        lastSpeakerWriteMaximum = 0
         report("audio-connected:" + (peripheral.name ?? "JUFF"))
         receive(line: "{\"type\":\"status\"}")
         beginWriteIfPossible()
@@ -565,6 +622,7 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        defer { updateSpeakerActivity() }
         switch central.state {
         case .poweredOn:
             startScanning()
@@ -633,6 +691,7 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
         }
         readyToWrite = false
         speakerTransport.resetConnection()
+        updateSpeakerActivity()
         cancelSpeakerPacing()
         speakerWatchdogWorkItem?.cancel()
         speakerWatchdogWorkItem = nil

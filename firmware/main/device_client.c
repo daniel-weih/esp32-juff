@@ -1,4 +1,5 @@
 #include "device_client.h"
+#include "voice_session.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -161,6 +162,14 @@ static void send_hello(void)
         cJSON_AddBoolToObject(message, "audioOutputEnabled", audio_io_is_available());
         cJSON_AddNumberToObject(message, "inputSampleRate", 16000);
         cJSON_AddNumberToObject(message, "outputSampleRate", 24000);
+        const voice_session_status_t state = voice_session_get();
+        cJSON *conversation = cJSON_AddObjectToObject(message, "conversation");
+        if (conversation != NULL) {
+            cJSON_AddStringToObject(conversation, "type", "conversation.state");
+            cJSON_AddStringToObject(conversation, "mode", voice_session_mode_name(state.mode));
+            cJSON_AddBoolToObject(conversation, "active", state.active);
+            cJSON_AddNumberToObject(conversation, "generation", state.generation);
+        }
     }
     send_json(message);
 }
@@ -187,6 +196,11 @@ static void handle_json_message(const char *data, size_t size)
         return;
     }
     const char *type = json_string(message, "type");
+
+    if (!voice_session_handle_control(message)) {
+        cJSON_Delete(message);
+        return;
+    }
 
     if (strcmp(type, "device.ready") == 0) {
         ESP_LOGI(TAG,
@@ -383,9 +397,10 @@ bool device_client_is_connected(void)
 
 void device_client_send_pcm(const uint8_t *data, size_t size)
 {
-    if (!device_client_is_ready() || data == NULL || size == 0 || !lock_sender()) {
+    if (!voice_session_can_stream() || !device_client_is_ready() || data == NULL || size == 0 || !lock_sender()) {
         return;
     }
+    if (!voice_session_can_stream()) { unlock_sender(); return; }
     const int result = esp_websocket_client_send_bin(s_client,
                                                       (const char *)data,
                                                       size,
@@ -400,6 +415,26 @@ void device_client_send_interrupt(void)
 {
     audio_io_clear("local interrupt");
     send_simple_event("interrupt");
+}
+
+void device_client_reset_conversation(void)
+{
+    s_reject_response_audio = true;
+    s_voice_ready = false;
+    s_input_suspended = false;
+}
+
+void device_client_send_conversation_state(void)
+{
+    const voice_session_status_t state = voice_session_get();
+    cJSON *message = cJSON_CreateObject();
+    if (message != NULL) {
+        cJSON_AddStringToObject(message, "type", "conversation.state");
+        cJSON_AddStringToObject(message, "mode", voice_session_mode_name(state.mode));
+        cJSON_AddBoolToObject(message, "active", state.active);
+        cJSON_AddNumberToObject(message, "generation", state.generation);
+    }
+    send_json(message);
 }
 
 bool device_client_try_voice_interrupt(void)

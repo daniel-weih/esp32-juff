@@ -25,6 +25,11 @@
 #define REFERENCE_MIN_RMS 80
 #define DETECTOR_RECOVERY_SAMPLES 8000
 #define SPEECH_CANDIDATE_SAMPLES 1920
+#if CONFIG_JUFF_BOARD_WAVESHARE_LCD_154
+#define WEAK_SPEECH_CANDIDATE_SAMPLES 5760
+#else
+#define WEAK_SPEECH_CANDIDATE_SAMPLES SPEECH_CANDIDATE_SAMPLES
+#endif
 
 static const char *TAG = "juff_aec";
 static aec_handle_t *s_aec;
@@ -53,6 +58,7 @@ static bool s_detection_allowed;
 static size_t s_playback_samples;
 static size_t s_recovery_samples;
 static size_t s_speech_candidate_samples;
+static size_t s_strong_speech_candidate_samples;
 static float s_noise_rms = 60.0f;
 static voice_frontend_pcm_callback_t s_pcm_callback;
 static voice_frontend_interrupt_callback_t s_interrupt_callback;
@@ -74,7 +80,7 @@ typedef struct {
     uint64_t clean_frame_energy;
     uint64_t mic_block_energy;
 } candidate_energy_t;
-static candidate_energy_t s_candidate_energy[SPEECH_CANDIDATE_SAMPLES / VAD_SAMPLES];
+static candidate_energy_t s_candidate_energy[WEAK_SPEECH_CANDIDATE_SAMPLES / VAD_SAMPLES];
 static size_t s_candidate_energy_position;
 static size_t s_candidate_energy_used;
 static uint64_t s_current_mic_energy;
@@ -146,12 +152,32 @@ static bool echo_guard_allows_interruption(void)
         && s_echo_guard_window.reference >= (uint64_t)REFERENCE_MIN_RMS
             * REFERENCE_MIN_RMS * s_echo_guard_window.samples) {
         // Only reject very small residual power while speaker reference is
-        // active. Keep the original 120 ms candidate and permit speech during
-        // reference silence. Even full-scale samples fit this uint64_t product.
+        // active, and permit speech during reference silence. Even full-scale
+        // samples fit this uint64_t product.
         return s_echo_guard_window.clean * 100U >= s_echo_guard_window.mic;
     }
 #endif
     return true;
+}
+
+static size_t speech_candidate_target(void)
+{
+    if (!echo_guard_allows_interruption()) return 0;
+#if CONFIG_JUFF_BOARD_WAVESHARE_LCD_154
+    if (s_echo_guard_used == ECHO_GUARD_BUCKET_COUNT
+        && s_echo_guard_window.reference >= (uint64_t)REFERENCE_MIN_RMS
+            * REFERENCE_MIN_RMS * s_echo_guard_window.samples
+        && (s_echo_guard_window.clean * 20U < s_echo_guard_window.mic
+            || s_echo_guard_window.clean * 4U < s_echo_guard_window.reference)) {
+        // Residual echo just above the rejection floor can survive 120 ms.
+        // Keep quieter near-end speech usable, but require 360 ms of stable
+        // evidence at 1–5% MIC power or below 25% reference power. A quiet MIC
+        // must not promote a small residual beside a loud reference to the
+        // fast path. Stronger speech and reference pauses retain 120 ms.
+        return WEAK_SPEECH_CANDIDATE_SAMPLES;
+    }
+#endif
+    return SPEECH_CANDIDATE_SAMPLES;
 }
 
 static void record_candidate_energy(uint64_t clean_energy)
@@ -169,7 +195,7 @@ static void record_candidate_energy(uint64_t clean_energy)
     if (s_candidate_energy_used < capacity) ++s_candidate_energy_used;
 }
 
-static void log_voice_interruption(float rms)
+static void log_voice_interruption(float rms, size_t qualified_samples)
 {
     uint64_t clean_energy = 0;
     for (int index = 0; index < s_chunk_size; ++index) {
@@ -208,14 +234,15 @@ static void log_voice_interruption(float rms)
     ESP_LOGI(TAG, "Voice interruption detected: clean RMS=%u, noise=%u"
              " block_mic=%u block_ref=%u block_clean=%u"
              " candidate_clean_mic_power_min=%llu max=%llu scale=1000 frames=%u zero_mic=%u"
-             " guard_ms=%u guard_ref=%u guard_power=%llu",
+             " guard_ms=%u guard_ref=%u guard_power=%llu qualified_ms=%u",
              (unsigned)rms, (unsigned)s_noise_rms,
              (unsigned)sqrt((double)s_current_mic_energy / s_chunk_size),
              (unsigned)sqrt((double)s_current_reference_energy / s_chunk_size),
              (unsigned)sqrt((double)clean_energy / s_chunk_size),
              (unsigned long long)(minimum == UINT64_MAX ? 0 : minimum),
              (unsigned long long)maximum, (unsigned)s_candidate_energy_used, zero_mic,
-             guard_ms, guard_reference, (unsigned long long)guard_power);
+             guard_ms, guard_reference, (unsigned long long)guard_power,
+             (unsigned)(qualified_samples * 1000 / SAMPLE_RATE));
 }
 
 static void upload(const int16_t *samples, size_t count)
@@ -307,31 +334,45 @@ static void process_vad_frame(voice_frontend_playback_t playback,
         if (!warm || !detect_speech) {
             vad_reset_trigger(s_vad);
         }
+        const size_t target = speech_candidate_target();
         // VAD can stay in its speech state across low-energy frames. Require
-        // 120 ms of fresh, continuously qualified signal before interrupting.
+        // fresh, continuously qualified signal before interrupting.
+        // Rejected echo must not pre-fill the candidate: otherwise a brief
+        // residual-power fluctuation can release an already complete trigger.
         if (warm && detect_speech && speech == VAD_SPEECH
-            && rms >= fmaxf(180.0f, s_noise_rms * 3.0f)) {
+            && rms >= fmaxf(180.0f, s_noise_rms * 3.0f)
+            && target != 0) {
             if (!s_interrupted) record_candidate_energy(energy);
-            if (s_speech_candidate_samples < SPEECH_CANDIDATE_SAMPLES) {
+            if (s_speech_candidate_samples < WEAK_SPEECH_CANDIDATE_SAMPLES) {
                 s_speech_candidate_samples += VAD_SAMPLES;
                 if (s_speech_candidate_samples > s_candidate_peak_samples)
                     s_candidate_peak_samples = s_speech_candidate_samples;
             }
+            // Keep separate evidence for the fast path. A weak frame resets
+            // fast confirmation, while stronger frames still count toward
+            // sustained speech; fluctuating speech must not lose both paths.
+            if (target == SPEECH_CANDIDATE_SAMPLES) {
+                if (s_strong_speech_candidate_samples < SPEECH_CANDIDATE_SAMPLES)
+                    s_strong_speech_candidate_samples += VAD_SAMPLES;
+            } else s_strong_speech_candidate_samples = 0;
         } else {
-            s_speech_candidate_samples = 0;
+            s_speech_candidate_samples = s_strong_speech_candidate_samples = 0;
         }
-        if (!s_interrupted && s_speech_candidate_samples >= SPEECH_CANDIDATE_SAMPLES
-            && echo_guard_allows_interruption()) {
+        const size_t qualified_samples = s_strong_speech_candidate_samples >= SPEECH_CANDIDATE_SAMPLES
+            ? SPEECH_CANDIDATE_SAMPLES
+            : s_speech_candidate_samples >= WEAK_SPEECH_CANDIDATE_SAMPLES
+                ? WEAK_SPEECH_CANDIDATE_SAMPLES : 0;
+        if (!s_interrupted && qualified_samples != 0) {
             // The application rejects voice interruption when explicitly muted.
             if (s_interrupt_callback != NULL && s_interrupt_callback(s_context)) {
                 s_interrupted = true;
                 freeze_history();
                 pending_has_current_frame = true;
-                log_voice_interruption(rms);
+                log_voice_interruption(rms, qualified_samples);
             }
         }
     } else {
-        s_speech_candidate_samples = 0;
+        s_speech_candidate_samples = s_strong_speech_candidate_samples = 0;
     }
 
     if (!playing && upload_enabled) {
@@ -430,7 +471,7 @@ void voice_frontend_reset_stream(void)
     s_playback_generation = 0;
     s_playback_samples = 0;
     s_recovery_samples = DETECTOR_RECOVERY_SAMPLES;
-    s_speech_candidate_samples = 0;
+    s_speech_candidate_samples = s_strong_speech_candidate_samples = 0;
     if (s_vad != NULL) vad_reset_trigger(s_vad);
 }
 
@@ -452,7 +493,7 @@ void voice_frontend_process(const int16_t *stereo, size_t frames,
         s_reference_seen = false;
         s_playback_samples = 0;
         s_recovery_samples = DETECTOR_RECOVERY_SAMPLES;
-        s_speech_candidate_samples = 0;
+        s_speech_candidate_samples = s_strong_speech_candidate_samples = 0;
         vad_reset_trigger(s_vad);
         s_detection_allowed = detect_speech;
     }
@@ -470,7 +511,7 @@ void voice_frontend_process(const int16_t *stereo, size_t frames,
     if (new_response || playing != s_was_playing) {
         reset_echo_guard();
         s_upload_used = 0;
-        s_speech_candidate_samples = 0;
+        s_speech_candidate_samples = s_strong_speech_candidate_samples = 0;
         vad_reset_trigger(s_vad);
         if (new_response || playing) {
             s_playback_samples = 0;

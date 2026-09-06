@@ -7,6 +7,14 @@
 #include <string.h>
 
 #include "voice_frontend.h"
+#include "voice_session_stubs.h"
+static bool wake_waiting;
+static bool mode_change_during_read;
+static uint32_t s_capture_conversation_generation;
+static void wake_word_reset(void) {}
+static bool wake_word_process(const int16_t *pcm, size_t frames, unsigned channels,
+                              bool playing, bool diagnostic)
+{ (void)pcm; (void)frames; (void)channels; (void)playing; (void)diagnostic; return wake_waiting; }
 
 #define CODEC_FRAME_SAMPLES 2400
 #define GATEWAY_FRAME_SAMPLES 1600
@@ -67,6 +75,7 @@ static int esp_codec_dev_read(void *codec, void *data, int bytes)
 #endif
     }
     if (shutdown_during_read) s_shutdown_requested = true;
+    if (mode_change_during_read) ++test_conversation_generation;
     return ESP_CODEC_DEV_OK;
 }
 
@@ -100,7 +109,7 @@ static voice_frontend_playback_t snapshot_frontend_playback(void)
 }
 static voice_frontend_playback_t snapshot_frontend_playback_after_read(voice_frontend_playback_t before)
 { return before; }
-void voice_frontend_reset_stream(void) { assert(s_shutdown_requested); }
+void voice_frontend_reset_stream(void) { assert(s_shutdown_requested || wake_waiting || mode_change_during_read); }
 void voice_frontend_process(const int16_t *stereo, size_t frames,
                             voice_frontend_playback_t playback,
                             bool upload_enabled, bool detect_speech)
@@ -144,6 +153,8 @@ int main(int argc, char **argv)
         expected_detection = false;
     }
     expected_upload = s_capture_enabled;
+    wake_waiting = strstr(argv[1], "wake-waiting") != NULL;
+    mode_change_during_read = strstr(argv[1], "mode-change") != NULL;
     if (setjmp(finished) == 0) capture_task(NULL);
     if (shutdown_during_read) {
         assert(task_deleted && reads == 1 && diagnostic_calls == 0
@@ -151,9 +162,9 @@ int main(int argc, char **argv)
         puts("Capture routing passed");
         return 0;
     }
-    assert(diagnostic_calls == 1);
-    assert(frontend_calls == (s_voice_frontend_ready ? 1U : 0U));
-    assert(uploads == (!s_voice_frontend_ready && s_capture_enabled
+    assert(diagnostic_calls == (wake_waiting || mode_change_during_read ? 0U : 1U));
+    assert(frontend_calls == (s_voice_frontend_ready && !wake_waiting && !mode_change_during_read ? 1U : 0U));
+    assert(uploads == (!wake_waiting && !mode_change_during_read && !s_voice_frontend_ready && s_capture_enabled
                        && !s_playing && s_pcm_callback != NULL ? 1U : 0U));
     for (unsigned i = 0; i < allocations_count; ++i) free(allocations[i]);
     puts("Capture routing passed");

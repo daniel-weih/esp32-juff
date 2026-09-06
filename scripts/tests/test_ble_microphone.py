@@ -22,6 +22,7 @@ class BLEMicrophoneTest(unittest.TestCase):
         cls.temporary = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.temporary.cleanup)
         output = Path(cls.temporary.name)
+        (output / "esp_err.h").write_text("#pragma once\ntypedef int esp_err_t;\n")
         source = (ROOT / "firmware/main/ble_manager.c").read_text()
         constants = "\n".join(re.findall(r"(?m)^#define BLE_MIC_.*$", source))
         frame = re.search(r"typedef struct \{[^{}]*\} ble_audio_frame_t;", source)

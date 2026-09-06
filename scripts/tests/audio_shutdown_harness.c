@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "voice_session_stubs.h"
+static uint32_t s_capture_conversation_generation;
 
 typedef int esp_err_t;
 typedef unsigned TickType_t;

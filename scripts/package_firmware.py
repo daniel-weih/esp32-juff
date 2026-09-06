@@ -50,7 +50,7 @@ def package_firmware(project_root, board_id):
         if not source.is_relative_to(build):
             raise ValueError("Flash image must be inside the board's build directory")
         data = source.read_bytes()
-        role = next((key for key in ("bootloader", "partition-table", "app")
+        role = next((key for key in ("bootloader", "partition-table", "app", "model")
                      if flasher.get(key, {}).get("file") == relative), None)
         if role is None:
             raise ValueError(f"Unsupported flash image: {relative}")
@@ -60,8 +60,14 @@ def package_firmware(project_root, board_id):
         files[filename] = data
         images.append({"role": role, "offset": offset, "file": filename,
                        "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
-    if {image["role"] for image in images} != {"bootloader", "partition-table", "app"}:
+    roles = {image["role"] for image in images}
+    if not {"bootloader", "partition-table", "app"}.issubset(roles):
         raise ValueError("Expected a bootloader, partition table, and application")
+    wake_word = bool(config.get("JUFF_WAKE_WORD"))
+    if wake_word:
+        model = next((image for image in images if image["role"] == "model"), None)
+        if model is None or b"wn9_nihaoxiaozhi_tts\0" not in files[model["file"]]:
+            raise ValueError("Wake-word firmware requires the matching WakeNet model image")
 
     # Resolve every license before touching an existing export or its archive.
     files.update(collect_firmware_licenses(project_root, build))
@@ -72,7 +78,9 @@ def package_firmware(project_root, board_id):
     manifest = {"schema_version": 1, "firmware_version": version, "board": board,
                 "features": {"voice_interrupt": voice_interrupt,
                              "acoustic_echo_cancellation": voice_interrupt,
-                             "aec_reference": aec_reference},
+                             "aec_reference": aec_reference,
+                             "wake_word": "你好小智" if wake_word else None,
+                             "conversation_idle_seconds": 180 if wake_word else None},
                 "flash_settings": flasher["flash_settings"], "images": images}
     files["manifest.json"] = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode()
     checksums = "".join(f"{image['sha256']}  {image['file']}\n" for image in images)
@@ -98,6 +106,7 @@ python3 -m esptool --chip {board['chip']} --port PORT write_flash @flash_args
 macOS 可运行 `shasum -a 256 -c SHA256SUMS` 校验；Linux 使用 `sha256sum -c SHA256SUMS`。
 首次覆盖其他固件前请完整备份目标设备 Flash。此包仅写入所列镜像，不包含 NVS
 或个人配置；同板型 JUFF 升级保留现有 NVS，配网与令牌通过 USB 或加密 BLE 设置。
+语音唤醒版本必须同时写入包内的 model 镜像；只写 app 不能安装唤醒模型。
 
 This package is only for **{board['name']}**. Replace `PORT` with the target
 device's serial port. Back up its flash before replacing other firmware.

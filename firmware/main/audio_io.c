@@ -1,4 +1,6 @@
 #include "audio_io.h"
+#include "voice_session.h"
+#include "wake_word.h"
 #include "board_config.h"
 
 #include <inttypes.h>
@@ -123,10 +125,13 @@ static microphone_stats_t s_diagnostic_stats;
 static bool s_voice_frontend_ready;
 static audio_barge_in_callback_t s_barge_in_callback;
 static audio_barge_in_callback_t s_barge_in_allowed_callback;
+static uint32_t s_capture_conversation_generation;
 
 static void deliver_captured_pcm(const uint8_t *data, size_t size, void *context)
 {
-    if (!s_shutdown_requested && s_pcm_callback != NULL) {
+    if (!s_shutdown_requested && s_pcm_callback != NULL && voice_session_can_stream()
+        && s_capture_conversation_generation == voice_session_get().generation) {
+        wake_word_observe_activity(data, size);
         s_pcm_callback(data, size, context);
     }
 }
@@ -916,6 +921,7 @@ static void capture_task(void *argument)
     uint32_t seen_rx_overflows = 0;
 #endif
     while (!s_shutdown_requested) {
+        s_capture_conversation_generation = voice_session_get().generation;
 #if CONFIG_JUFF_VOICE_BARGE_IN
         const voice_frontend_playback_t before_read = snapshot_frontend_playback();
 #endif
@@ -923,7 +929,15 @@ static void capture_task(void *argument)
                                               codec_pcm,
                                               CAPTURE_FRAMES * CAPTURE_CHANNELS * sizeof(*codec_pcm));
         if (s_shutdown_requested) break;
+        if (s_capture_conversation_generation != voice_session_get().generation) {
+            wake_word_reset();
+#if CONFIG_JUFF_VOICE_BARGE_IN
+            if (s_voice_frontend_ready) voice_frontend_reset_stream();
+#endif
+            continue;
+        }
         if (result != ESP_CODEC_DEV_OK) {
+            wake_word_reset();
             ESP_LOGW(TAG, "Microphone read failed (codec status=%d)", result);
 #if CONFIG_JUFF_VOICE_BARGE_IN
             if (s_voice_frontend_ready) voice_frontend_reset_stream();
@@ -935,8 +949,18 @@ static void capture_task(void *argument)
         if (recover_frontend_rx_overflow(&seen_rx_overflows)) {
             // This read may straddle a dropped DMA block. Start with the next
             // complete read instead of feeding a discontinuity to AEC/VAD.
+            wake_word_reset();
             continue;
         }
+#endif
+        if (wake_word_process(codec_pcm, CAPTURE_FRAMES, CAPTURE_CHANNELS,
+                              s_playing, s_diagnostic_collecting)) {
+#if CONFIG_JUFF_VOICE_BARGE_IN
+            if (s_voice_frontend_ready) voice_frontend_reset_stream();
+#endif
+            continue;
+        }
+#if CONFIG_JUFF_VOICE_BARGE_IN
         // Diagnostic statistics still measure the unprocessed physical mic.
         for (size_t index = 0; index < CAPTURE_FRAMES; ++index) {
             gateway_pcm[index] = codec_pcm[index * CAPTURE_CHANNELS];
@@ -1228,7 +1252,11 @@ esp_err_t audio_io_init(audio_pcm_callback_t pcm_callback,
 
     if (xTaskCreatePinnedToCore(capture_task,
                                 "juff_capture",
+#if CONFIG_JUFF_WAKE_WORD
+                                8192,
+#else
                                 s_voice_frontend_ready ? 8192 : 4096,
+#endif
                                 NULL,
                                 6,
                                 NULL,

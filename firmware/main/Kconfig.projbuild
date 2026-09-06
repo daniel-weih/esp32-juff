@@ -51,6 +51,15 @@ menu "Juff voice terminal"
 
     if JUFF_AUDIO_ENABLED
 
+        config JUFF_WAKE_WORD
+            bool "Offline wake word and selectable conversation mode"
+            default y
+            select SR_WN_WN9_NIHAOXIAOZHI_TTS
+            help
+                Adds local WakeNet detection of Ni Hao Xiao Zhi on both boards.
+                The device keeps its continuous mode until the user changes it.
+                Flash the model partition together with the application.
+
         config JUFF_AUDIO_STARTUP_SELF_TEST
             bool "Play diagnostic tones automatically at startup"
             default n

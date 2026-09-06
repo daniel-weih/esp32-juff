@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "voice_session_stubs.h"
 #include <stdarg.h>
 #include <inttypes.h>
 #include <limits.h>

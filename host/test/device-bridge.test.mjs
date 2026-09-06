@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import http from 'node:http'
-import { once } from 'node:events'
+import { EventEmitter, once } from 'node:events'
 import test from 'node:test'
 import WebSocket, { WebSocketServer } from 'ws'
 import { createDeviceBridge } from '../src/device-bridge.mjs'
@@ -150,4 +150,70 @@ test('rejects an invalid device token', async t => {
   device.send(JSON.stringify({ type: 'hello', token: 'wrong-token-value' }))
   const [code] = await once(device, 'close')
   assert.equal(code, 1008)
+})
+
+test('Wi-Fi standby opens no cloud session and repeated mode handshakes preserve playback', { timeout: 10000 }, async t => {
+  const clients = []
+  class Voice extends EventEmitter {
+    constructor() { super(); clients.push(this); this.connected = false; this.sent = [] }
+    async connect() { this.connected = true; this.emit('event', { type: 'voice.ready' }); return { backend: {} } }
+    close() { this.connected = false; this.closed = true; this.emit('close', 1000, '') }
+    send(event) { this.sent.push(event); return true }
+    sendAudio() { throw new Error('Standby audio reached the gateway') }
+  }
+  const bridge = createDeviceBridge({ bridgeHost: '127.0.0.1', bridgePort: 0,
+    devicePath: '/device', deviceToken: 'synthetic-test-token', gatewayUrl: 'http://127.0.0.1',
+    gatewaySessionId: 'fixture', gatewayTakeover: false, workingDirectory: process.cwd(),
+  }, { logger: () => {}, GatewayClientImpl: Voice })
+  await bridge.start()
+  t.after(() => bridge.close())
+  const device = new WebSocket(`ws://127.0.0.1:${bridge.address.port}/device`)
+  await once(device, 'open')
+  const next = messageQueue(device)
+  const state = (generation, active) => ({ type: 'conversation.state', mode: 'wake', generation, active })
+  device.send(JSON.stringify({ type: 'hello', token: 'synthetic-test-token', conversation: state(1, false) }))
+  assert.equal(JSON.parse((await next()).data).type, 'bridge.connecting')
+  assert.equal(JSON.parse((await next()).data).type, 'playback.clear')
+  assert.equal(JSON.parse((await next()).data).type, 'conversation.ack')
+  assert.equal(clients.length, 0)
+  device.send(Buffer.from([1, 2]))
+  device.send(JSON.stringify(state(2, true)))
+  assert.equal(JSON.parse((await next()).data).type, 'playback.clear')
+  assert.equal(JSON.parse((await next()).data).type, 'conversation.ack')
+  assert.deepEqual(JSON.parse((await next()).data), { type: 'voice.ready', conversationGeneration: 2 })
+  const greeting = JSON.parse((await next()).data)
+  assert.equal(greeting.type, 'audio.begin')
+  assert.equal(greeting.sampleRate, 24000)
+  assert.equal(greeting.conversationGeneration, 2)
+  let greetingBytes = 0
+  while (true) {
+    const frame = await next()
+    if (frame.isBinary) greetingBytes += frame.data.length
+    else {
+      assert.deepEqual(JSON.parse(frame.data), { type: 'audio.done', responseId: greeting.responseId,
+        conversationGeneration: 2 })
+      break
+    }
+  }
+  assert.ok(greetingBytes >= 12000 && greetingBytes <= 72000)
+  device.send(JSON.stringify({ type: 'playback.started', responseId: greeting.responseId }))
+  device.send(JSON.stringify({ type: 'playback.ended', responseId: greeting.responseId }))
+  device.send(JSON.stringify(state(2, true)))
+  assert.equal(JSON.parse((await next()).data).type, 'conversation.ack')
+  assert.deepEqual(clients[0].sent, [], 'Local prompt playback must not reach cloud response tracking')
+  const audio = { type: 'audio.delta', responseId: 'fixture', audio: Buffer.from([3, 4]).toString('base64') }
+  clients[0].emit('event', audio)
+  assert.equal(JSON.parse((await next()).data).conversationGeneration, 2)
+  assert.equal((await next()).isBinary, true)
+  device.send(JSON.stringify(state(2, true)))
+  assert.equal(JSON.parse((await next()).data).type, 'conversation.ack')
+  clients[0].emit('event', audio)
+  assert.equal((await next()).isBinary, true, 'Duplicate handshake must not emit another audio.begin')
+  device.send(JSON.stringify(state(3, false)))
+  assert.equal(JSON.parse((await next()).data).type, 'playback.clear')
+  assert.equal(JSON.parse((await next()).data).type, 'conversation.ack')
+  assert.equal(clients[0].closed, true)
+  clients[0].emit('event', audio)
+  device.send(JSON.stringify(state(3, false)))
+  assert.equal(JSON.parse((await next()).data).type, 'conversation.ack', 'Old cloud audio must be fenced')
 })

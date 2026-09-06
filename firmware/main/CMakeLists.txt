@@ -3,6 +3,8 @@ idf_component_register(
         "app_main.c"
         "audio_io.c"
         "voice_frontend.c"
+        "voice_session.c"
+        "wake_word.c"
         "ble_manager.c"
         "board_display.c"
         "companion_face.c"

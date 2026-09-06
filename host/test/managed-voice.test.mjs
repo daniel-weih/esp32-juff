@@ -38,9 +38,11 @@ test('managed BLE worker keeps multiline transcripts out of operational logs', {
   })
   await mkdir(path.join(host, 'src'), { recursive: true })
   await mkdir(bleDirectory, { recursive: true })
-  for (const name of ['run.mjs', 'config.mjs', 'device-bridge.mjs', 'gateway-client.mjs']) {
+  for (const name of ['run.mjs', 'config.mjs', 'device-bridge.mjs', 'gateway-client.mjs', 'conversation-client.mjs', 'playback-diagnostics.mjs', 'wake-acknowledgement.mjs']) {
     await copyFile(new URL(`../src/${name}`, import.meta.url), path.join(host, 'src', name))
   }
+  await mkdir(path.join(host, 'assets'))
+  await copyFile(new URL('../assets/wake-ack.pcm', import.meta.url), path.join(host, 'assets/wake-ack.pcm'))
   await symlink(fileURLToPath(new URL('../node_modules', import.meta.url)), path.join(host, 'node_modules'), 'dir')
   await writeFile(path.join(bleDirectory, 'JuffBLE'),
     '#!/usr/bin/env node\nprocess.stdin.resume(); process.stdout.write("STATE audio-connected:fixture\\n");\n', { mode: 0o700 })
@@ -66,7 +68,8 @@ test('managed BLE worker keeps multiline transcripts out of operational logs', {
     await delay(10)
   }
   assert.ok(output.includes('Juff ready: test-model; BLE only'), output)
-  assert.ok(output.includes('BLE voice ready:'), output)
+  assert.ok(output.includes('BLE voice bridge connected:'), output)
+  assert.ok(!output.includes('BLE voice ready:'), 'An open local socket is not cloud voice readiness')
   assert.ok(logs.read().some(entry => entry.message === 'QWEN EVENT response.done: test-response'), output)
   for (const value of ['private-first-line', 'private-second-line']) {
     assert.ok(!output.includes(value), 'Managed stdout must omit the complete transcript')

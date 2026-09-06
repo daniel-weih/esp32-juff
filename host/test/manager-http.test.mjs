@@ -3,19 +3,26 @@ import http from 'node:http'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
+import { mkdtemp, rm } from 'node:fs/promises'
+import os from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
 import { createManagerServer } from '../src/manager/server.mjs'
 import { LogStore } from '../src/manager/logs.mjs'
 import { validateProfiles } from '../src/manager/profiles.mjs'
+import { AssistantProfileStore } from '../src/manager/assistant.mjs'
 
 async function fixture(t) {
   const calls = [], logs = new LogStore()
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'juff-assistant-http-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const assistant = new AssistantProfileStore({ file: path.join(directory, 'ASSISTANT.md') })
   let profiles = []
   const manager = {
     logs, refresh: async () => {}, close: async () => {},
     snapshot: () => ({ devices: profiles, services: [], logs: logs.read() }),
     command: async (id, action) => { calls.push([id, action]); return manager.snapshot() },
     updateProfiles: async operation => { profiles = validateProfiles(operation(profiles)); return manager.snapshot() },
+    readAssistant: () => assistant.read(), saveAssistant: input => assistant.save(input),
   }
   const app = createManagerServer(manager, { publicDirectory: fileURLToPath(new URL('../public', import.meta.url)), port: 0 })
   const address = await app.start()
@@ -25,6 +32,27 @@ async function fixture(t) {
   const headers = { origin, 'content-type': 'application/json', 'x-juff-csrf': state.csrfToken }
   return { origin, headers, calls, manager }
 }
+
+test('assistant API enforces origin, CSRF, revision and content limits without exposing prompts in state', async t => {
+  const { origin, headers } = await fixture(t)
+  const endpoint = `${origin}/api/assistant`
+  const initial = await (await fetch(endpoint)).json()
+  const input = { content: '你叫小智，回答简短自然。', revision: initial.revision }
+  for (const override of [{ origin: 'https://untrusted.invalid' }, { 'x-juff-csrf': '' }]) {
+    assert.equal((await fetch(endpoint, { method: 'PUT', headers: { ...headers, ...override }, body: JSON.stringify(input) })).status, 403)
+  }
+  assert.equal((await fetch(endpoint, { headers: { origin: 'https://untrusted.invalid' } })).status, 403)
+  const response = await fetch(endpoint, { method: 'PUT', headers, body: JSON.stringify(input) })
+  assert.equal(response.status, 200)
+  const saved = await response.json()
+  assert.equal(saved.content, input.content)
+  assert.equal((await fetch(endpoint, { method: 'PUT', headers, body: JSON.stringify(input) })).status, 409)
+  assert.equal((await fetch(endpoint, { method: 'PUT', headers, body: JSON.stringify({ content: '文'.repeat(4001), revision: saved.revision }) })).status, 400)
+  assert.equal((await fetch(endpoint, { method: 'PUT', headers, body: JSON.stringify({ content: 'x'.repeat(33000), revision: saved.revision }) })).status, 413)
+  // Four thousand astral characters are 16 KB in UTF-8 before JSON framing.
+  assert.equal((await fetch(endpoint, { method: 'PUT', headers, body: JSON.stringify({ content: '😀'.repeat(4000), revision: saved.revision }) })).status, 200)
+  assert.ok(!(await (await fetch(`${origin}/api/state`)).text()).includes('😀'))
+})
 
 test('dashboard and assets load locally with restrictive browser headers', async t => {
   const { origin } = await fixture(t)

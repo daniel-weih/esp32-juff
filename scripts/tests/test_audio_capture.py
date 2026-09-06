@@ -77,6 +77,22 @@ class AudioCaptureTest(unittest.TestCase):
             with self.subTest(small=small):
                 self.run_scenario(small, False, "fallback")
 
+    def test_standby_never_uploads_or_runs_interruption_on_either_board(self):
+        for small in (False, True):
+            for aec in (False, True):
+                with self.subTest(small=small, aec=aec):
+                    self.run_scenario(small, aec, "fallback-wake-waiting")
+                    if aec:
+                        self.run_scenario(small, aec, "frontend-wake-waiting")
+
+    def test_mode_change_during_codec_read_discards_the_entire_old_frame(self):
+        for small in (False, True):
+            for aec in (False, True):
+                with self.subTest(small=small, aec=aec):
+                    self.run_scenario(small, aec, "fallback-mode-change")
+                    if aec:
+                        self.run_scenario(small, aec, "frontend-mode-change")
+
     def test_shutdown_during_read_discards_audio_and_stops_capture(self):
         for small in (False, True):
             for aec in (False, True):

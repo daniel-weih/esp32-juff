@@ -5,10 +5,75 @@ All notable changes to JUFF are documented here. The project follows
 
 ## [Unreleased]
 
-Current firmware development version: `0.6.10-dev`.
+Current firmware development version: `0.7.0-dev`.
+
+### 0.7.0-dev voice wake mode
+
+- Keep credit-based BLE speaker writes within one 251-byte link payload,
+  including L2CAP and ATT overhead. This avoids the extra fragment produced
+  by a 253-byte GATT value at MTU 256; retain device credits, CoreBluetooth
+  backpressure, the existing codec and legacy pacing. Cover packet boundaries,
+  exact byte order and receive-window limits across multiple negotiated sizes.
+- Add offline WakeNet detection of “你好小智” on both hardware profiles, with
+  persistent device-side LIVE / WAKE selection and continuous mode as default.
+- Close a wake-mode conversation after 180 seconds without speech or playback;
+  keep standby PCM local and require another wake after timeout or reconnection.
+- Close and recreate each device's cloud voice connection at conversation
+  boundaries. Fence late connections and events with generation identifiers.
+- Tag Mac-generated speaker failure recovery with the current conversation
+  generation so firmware accepts the clear after a handshake. Test the real
+  recovery message against the firmware gate in LIVE / WAKE modes, preserving
+  stale-event rejection, legacy compatibility and the wake idle deadline.
+- Play a cached “我在” acknowledgement when cloud voice input becomes ready
+  after a wake. Avoid per-wake synthesis, duplicate greetings on reconnect and
+  forwarding local playback events into the cloud response lifecycle.
+- Reset the small-board interruption candidate whenever its echo guard rejects
+  a frame. Rejected echo previously accumulated the full 120 ms candidate and
+  could trigger cancellation on a brief residual-power fluctuation.
+- Require 360 ms of continuous evidence for candidates retaining 1–5% of MIC
+  power or less than 25% of reference power while speaker reference is active;
+  keep the 120 ms path for stronger speech
+  and reference pauses. Keep fast evidence separate without discarding sustained
+  speech when its strength crosses between the two paths.
+- Declare a finite real-time I/O activity while the Mac is playing queued audio
+  remotely, releasing it at playback completion, cancellation or disconnection.
+- Request a 15 ms BLE connection interval consistent with Apple's accessory
+  guidance; report rejected updates and the actual negotiated interval. The old
+  7.5–15 ms range admitted a 13.75 ms interval during a run with sustained
+  playback starvation. The central remains responsible for the final parameters.
+- Retain separate hardware-specific AEC paths, battery UI,
+  brightness, pairing and power controls. Show the selected mode in the WebUI.
+- Package the separate wake model image without moving existing NVS/app data;
+  validate its inclusion and retain ESP-SR notices with firmware releases.
+- Reserve internal memory for display, radio and task startup; place general
+  allocations in PSRAM. Exercise model inference and recreation at boot, and
+  avoid the pinned WakeNet9 library's crashing state-cleanup function.
+- Move BLE audio packet assembly into external BSS to retain radio/task memory
+  headroom with AEC and WakeNet enabled. Verify both boards' boot, retained pairing,
+  local speaker/microphone self-test and synthetic-wake acknowledgement on hardware.
+- Add deterministic timeout, persistence, transport and audio-routing tests,
+  plus both display layouts. Physical wake accuracy remains unvalidated.
+- Add per-response BLE playback diagnostics for source timing, unacknowledged
+  host/BLE audio, device buffering and new underruns. Keep audio, transcripts
+  and response identifiers out of diagnostic output. Record reproduced
+  starvation, the packet-sizing fix and slower-link capacity limits in the
+  acoustic validation notes.
 
 ### Local service management dashboard
 
+- Recover waiting or displaced devices when the shared Qwen voice slot becomes
+  available. Reapply the existing voice configuration without takeover, preserve
+  microphone mute, and cancel recovery after explicit mute/sleep or session end.
+  Test competing clients with real local WebSockets and the pinned Qwen arbiter.
+- Distinguish local BLE bridge connection from cloud voice readiness, and update
+  the large-board documentation to separate current installation checks from
+  historical black-screen investigation and visual acceptance limits.
+- Add an Assistant settings page for Qwen's native local `ASSISTANT.md`, with a
+  Xiaozhi identity preset, 4000-character limit, private atomic persistence and
+  previous-version backup. Reject stale edits and keep prompt content out of logs.
+- Save without interrupting a conversation, or reconnect only previously running
+  device workers to load the profile. Preserve editor drafts across polling and
+  navigation; document the page with a widescreen synthetic-data capture.
 - Add `make admin` and a local JUFF dashboard on port 3210, independent of voice
   services. Manage the shared gateway and each device's BLE and Wi-Fi workers.
 - Track process health, device connection, firmware, battery and audio metrics;
@@ -102,7 +167,7 @@ Current firmware development version: `0.6.10-dev`.
 - Restore the large board's 80 MHz display clock and single initialization
   sequence; remove temporary LCD, backlight and power-register diagnostics.
 - Distinguish the earlier AEC measurements from the subsequent black-screen
-  investigation. Display recovery remains unconfirmed on the physical board.
+  investigation. Display recovery had not been confirmed on hardware at that stage.
 - Reject hardware-derived device IDs in publishable files and staged content,
   including when only the working copy has been sanitized.
 

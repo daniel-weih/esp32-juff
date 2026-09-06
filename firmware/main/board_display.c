@@ -3,6 +3,7 @@
 #include "companion_face.h"
 #include "battery_indicator.h"
 #include "battery_monitor.h"
+#include "voice_session.h"
 
 #include <inttypes.h>
 #include <limits.h>
@@ -103,6 +104,10 @@ static lv_obj_t *s_connection_status_label;
 static lv_obj_t *s_connection_detail_label;
 static lv_obj_t *s_pairing_button;
 static lv_obj_t *s_pairing_button_label;
+static lv_obj_t *s_mode_overlay;
+static lv_obj_t *s_mode_label;
+static lv_obj_t *s_continuous_button;
+static lv_obj_t *s_wake_button;
 
 #if !CONFIG_JUFF_BOARD_WAVESHARE_LCD_154
 static const uint8_t s_cmd_colmod[] = { 0x05 };
@@ -637,6 +642,7 @@ static void refresh_status_ui(void)
         // LVGL objects remain owned by this task. Hide any pairing sheet so
         // that holding PWR always reveals the release-to-shut-down message.
         lv_obj_add_flag(s_connection_overlay, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_mode_overlay, LV_OBJ_FLAG_HIDDEN);
         set_label_text(s_main_title, "good night.");
         set_label_text(s_main_detail, "Release to power off");
         set_label_text(s_primary_button_label, "sweet dreams");
@@ -659,6 +665,15 @@ static void refresh_status_ui(void)
     const bool voice_ready = ble_voice_active || device_client_is_voice_active();
     const bool playing = audio_io_is_playing();
     const bool audio_ready = audio_io_is_available();
+    const voice_session_status_t conversation = voice_session_get();
+    const bool waiting = conversation.mode == VOICE_MODE_WAKE && !conversation.active;
+    set_label_text(s_mode_label, conversation.mode == VOICE_MODE_WAKE ? "WAKE" : "LIVE");
+    lv_obj_set_style_bg_color(s_continuous_button,
+        lv_color_hex(conversation.mode == VOICE_MODE_CONTINUOUS ? COLOR_PRIMARY : COLOR_SURFACE), 0);
+    lv_obj_set_style_bg_color(s_wake_button,
+        lv_color_hex(conversation.mode == VOICE_MODE_WAKE ? COLOR_PRIMARY : COLOR_SURFACE), 0);
+    if (conversation.supported) lv_obj_clear_state(s_wake_button, LV_STATE_DISABLED);
+    else lv_obj_add_state(s_wake_button, LV_STATE_DISABLED);
     const bool voice_interrupt_allowed = audio_io_supports_voice_barge_in()
         && (ble_voice_active ? ble_manager_allows_voice_interrupt()
                              : device_client_allows_voice_interrupt());
@@ -680,6 +695,12 @@ static void refresh_status_ui(void)
         mood = COMPANION_MOOD_ALERT;
         title = "a little hiccup.";
         detail = "check audio on your Mac";
+    } else if (waiting && conversation.connected) {
+        mood = COMPANION_MOOD_DOZING;
+        title = !conversation.supported ? "wake unavailable." : "say hello.";
+        detail = !conversation.supported ? "tap WAKE to change mode"
+            : !conversation.acknowledged ? "open the updated Mac service"
+            : "say \"ni hao xiao zhi\"";
     } else if (!voice_ready) {
         mood = bridge_connected || ble_connected ? COMPANION_MOOD_THINKING
                                                 : COMPANION_MOOD_DOZING;
@@ -716,7 +737,7 @@ static void refresh_status_ui(void)
     const char *action = can_interrupt
         ? (voice_state == VOICE_VISUAL_PROCESSING ? LV_SYMBOL_CLOSE "  cancel"
                                                  : LV_SYMBOL_STOP "  stop")
-        : LV_SYMBOL_BLUETOOTH "  connection";
+        : waiting ? LV_SYMBOL_SETTINGS "  voice mode" : LV_SYMBOL_BLUETOOTH "  connection";
     set_label_text(s_main_title, title);
     set_label_text(s_main_detail, detail);
     set_label_text(s_primary_button_label, action);
@@ -844,6 +865,10 @@ static void primary_clicked(lv_event_t *event)
     }
     const bool ble_voice_active = ble_manager_is_voice_active();
     const bool voice_ready = ble_voice_active || device_client_is_voice_active();
+    if (voice_session_waiting()) {
+        board_display_set_notice("Say hello to wake me", "ni hao xiao zhi", 1800);
+        return;
+    }
     const bool can_interrupt = audio_io_is_playing()
         || voice_state == VOICE_VISUAL_LISTENING
         || voice_state == VOICE_VISUAL_PROCESSING
@@ -969,10 +994,34 @@ static void place(lv_obj_t *object, int x, int y, int width, int height)
     lv_obj_set_size(object, width, height);
 }
 
+static void mode_clicked(lv_event_t *event)
+{
+    if (display_shutdown_state() != DISPLAY_RUNNING || lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    lv_obj_clear_flag(s_mode_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_mode_overlay);
+}
+
+static void mode_close_clicked(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) lv_obj_add_flag(s_mode_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void mode_selected(lv_event_t *event)
+{
+    if (display_shutdown_state() != DISPLAY_RUNNING || lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    const voice_mode_t mode = lv_event_get_target(event) == s_wake_button
+        ? VOICE_MODE_WAKE : VOICE_MODE_CONTINUOUS;
+    const esp_err_t error = voice_session_set_mode(mode);
+    if (error == ESP_OK) lv_obj_add_flag(s_mode_overlay, LV_OBJ_FLAG_HIDDEN);
+    else board_display_set_notice("Couldn't change mode", esp_err_to_name(error), 2500);
+    refresh_status_ui();
+}
+
 static void main_action_clicked(lv_event_t *event)
 {
     if (display_shutdown_state() != DISPLAY_RUNNING
         || lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    if (voice_session_waiting()) { mode_clicked(event); return; }
     voice_visual_state_t state = VOICE_VISUAL_IDLE;
     char title[40], detail[96];
     bool testing;
@@ -998,6 +1047,10 @@ static void create_ui(void)
     const int header_y = UI_COMPACT ? 9 : 21;
     lv_obj_t *brand = make_label(screen, "juff.", &lv_font_montserrat_16, COLOR_TEXT);
     lv_obj_set_pos(brand, margin + 12, header_y + 7);
+    lv_obj_t *mode = create_button(screen, UI_COMPACT ? 74 : 96, header_y,
+                                  UI_COMPACT ? 44 : 62, 34, "", COLOR_SURFACE, mode_clicked);
+    s_mode_label = make_label(mode, "LIVE", &lv_font_montserrat_12, COLOR_TEXT);
+    lv_obj_center(s_mode_label);
     s_status_dot = lv_obj_create(screen);
     style_panel(s_status_dot, COLOR_PRIMARY_DEEP, LV_RADIUS_CIRCLE);
     place(s_status_dot, margin, header_y + 14, 5, 5);
@@ -1096,6 +1149,29 @@ static void create_ui(void)
     s_pairing_button_label = make_label(s_pairing_button, "+  pair a new Mac",
                                         &lv_font_montserrat_12, COLOR_TEXT);
     lv_obj_center(s_pairing_button_label);
+
+    s_mode_overlay = lv_obj_create(screen);
+    style_panel(s_mode_overlay, COLOR_TEXT, 0);
+    place(s_mode_overlay, 0, 0, LCD_WIDTH, LCD_HEIGHT);
+    lv_obj_set_style_bg_opa(s_mode_overlay, LV_OPA_50, 0);
+    lv_obj_add_flag(s_mode_overlay, LV_OBJ_FLAG_HIDDEN | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *mode_sheet = lv_obj_create(s_mode_overlay);
+    style_panel(mode_sheet, COLOR_BACKGROUND, UI_COMPACT ? 18 : 24);
+    place(mode_sheet, UI_COMPACT ? 6 : 16, UI_COMPACT ? 6 : 76,
+          UI_COMPACT ? 228 : 288, UI_COMPACT ? 228 : 328);
+    lv_obj_t *mode_heading = make_label(mode_sheet, "let's talk.", &lv_font_montserrat_16, COLOR_TEXT);
+    lv_obj_set_pos(mode_heading, inner, UI_COMPACT ? 17 : 24);
+    create_button(mode_sheet, UI_COMPACT ? 182 : 232, UI_COMPACT ? 6 : 12,
+                  36, 36, LV_SYMBOL_CLOSE, COLOR_SURFACE, mode_close_clicked);
+    lv_obj_t *mode_detail = make_label(mode_sheet,
+        "Wake word: ni hao xiao zhi\nBack to sleep after 3 quiet minutes.",
+        UI_COMPACT ? &lv_font_montserrat_12 : &lv_font_montserrat_14, COLOR_MUTED);
+    place(mode_detail, inner, UI_COMPACT ? 58 : 88, content_width, UI_COMPACT ? 45 : 64);
+    lv_label_set_long_mode(mode_detail, LV_LABEL_LONG_WRAP);
+    s_continuous_button = create_button(mode_sheet, inner, UI_COMPACT ? 113 : 182,
+        content_width, UI_COMPACT ? 42 : 48, "LIVE   always listening", COLOR_PRIMARY, mode_selected);
+    s_wake_button = create_button(mode_sheet, inner, UI_COMPACT ? 166 : 246,
+        content_width, UI_COMPACT ? 42 : 48, "WAKE   say hello first", COLOR_SURFACE, mode_selected);
     refresh_status_ui();
 }
 

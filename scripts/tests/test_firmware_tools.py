@@ -266,6 +266,29 @@ print(json.dumps(rows))
                         self.assertIs(features["acoustic_echo_cancellation"], enabled)
                         self.assertEqual(features["aec_reference"], reference if enabled else "none")
 
+    def test_wake_firmware_requires_model_and_packages_its_flash_offset_and_checksum(self):
+        board = BOARDS[1]
+        build = self.build_fixture(board)
+        config_path = build / "config/sdkconfig.json"
+        config_path.write_text(json.dumps(json.loads(config_path.read_text()) | {"JUFF_WAKE_WORD": True}))
+        with self.assertRaisesRegex(ValueError, "WakeNet model"):
+            PACKAGER.package_firmware(self.root, board)
+        model = build / "srmodels/srmodels.bin"
+        model.parent.mkdir()
+        model.write_bytes(b"synthetic wn9_nihaoxiaozhi_tts\0 model fixture")
+        flasher_path = build / "flasher_args.json"
+        flasher = json.loads(flasher_path.read_text())
+        flasher["flash_files"]["0x420000"] = "srmodels/srmodels.bin"
+        flasher["model"] = {"file": "srmodels/srmodels.bin", "offset": "0x420000"}
+        flasher_path.write_text(json.dumps(flasher))
+        with zipfile.ZipFile(PACKAGER.package_firmware(self.root, board)) as bundle:
+            manifest = json.loads(bundle.read(f"{board}/manifest.json"))
+            image = next(image for image in manifest["images"] if image["role"] == "model")
+            self.assertEqual(image["offset"], "0x420000")
+            self.assertEqual(image["sha256"], hashlib.sha256(model.read_bytes()).hexdigest())
+            self.assertEqual(manifest["features"]["wake_word"], "你好小智")
+            self.assertIn(image["file"], bundle.read(f"{board}/flash_args").decode())
+
     def test_wrong_hardware_or_private_config_cannot_be_packaged(self):
         board = BOARDS[1]
         build = self.build_fixture(board)

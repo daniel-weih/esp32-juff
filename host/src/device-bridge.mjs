@@ -2,6 +2,7 @@ import { timingSafeEqual } from 'node:crypto'
 import http from 'node:http'
 import WebSocket, { WebSocketServer } from 'ws'
 import { GatewayClient } from './gateway-client.mjs'
+import { ConversationClient } from './conversation-client.mjs'
 
 const FORWARDED_DEVICE_EVENTS = new Set([
   'interrupt',
@@ -82,6 +83,8 @@ export function createDeviceBridge(config, {
             type: 'audio.begin',
             responseId,
             sampleRate: Number(event.sampleRate) || 24000,
+            ...(event.conversationGeneration === undefined ? {}
+              : { conversationGeneration: event.conversationGeneration }),
           })
         }
         socket.send(Buffer.from(event.audio || '', 'base64'), { binary: true })
@@ -110,25 +113,27 @@ export function createDeviceBridge(config, {
       active = session
       sendJson(socket, { type: 'bridge.connecting' })
 
-      const gateway = new GatewayClientImpl({
+      const gateway = new ConversationClient({
         baseUrl: config.gatewayUrl,
         sessionId: config.gatewaySessionId,
         takeover: config.gatewayTakeover,
         inputEnabled: message.audioInputEnabled !== false,
         outputEnabled: message.audioOutputEnabled !== false,
         workingDirectory: config.workingDirectory,
-      })
+      }, { GatewayClientImpl })
       session.gateway = gateway
       gateway.on('event', handleGatewayEvent)
       gateway.on('error', error => {
         logger('error', 'gateway websocket error', { error: error.message })
       })
       gateway.on('close', (code, reason) => {
-        if (socket.readyState === WebSocket.OPEN) socket.close(1011, `gateway closed: ${code} ${reason}`)
+        logger('info', 'device voice session closed', { code, reason })
       })
+      if (message.conversation) gateway.setConversation(message.conversation)
 
       try {
         const health = await gateway.connect()
+        if (!health || socket.readyState !== WebSocket.OPEN) return
         sendJson(socket, {
           type: 'device.ready',
           deviceId: String(message.deviceId || 'unknown'),
@@ -172,6 +177,10 @@ export function createDeviceBridge(config, {
       try {
         message = JSON.parse(data.toString())
       } catch {
+        return
+      }
+      if (message.type === 'conversation.state') {
+        session.gateway?.setConversation(message)
         return
       }
       if (!FORWARDED_DEVICE_EVENTS.has(message.type)) return

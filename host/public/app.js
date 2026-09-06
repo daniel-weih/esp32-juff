@@ -25,10 +25,12 @@ const escape = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': 
 const $ = selector => document.querySelector(selector)
 const face = '<svg class="device-face" viewBox="0 0 52 38" aria-hidden="true"><path d="m7 8 10 6-10 6m38-12-10 6 10 6M22 28l10-1"/></svg>'
 const labels = { stopped: '已停止', running: '运行中', starting: '启动中', stopping: '停止中', error: '启动异常', unhealthy: '等待恢复', external: '外部运行' }
-const pageNames = { overview: '服务总览', devices: '我的设备', logs: '运行日志' }
+const pageNames = { overview: '服务总览', devices: '我的设备', assistant: '助手设定', logs: '运行日志' }
 let state = null, csrf = '', offline = false, polling = false, page = 'overview', editing = null
 let logService = '', logSearch = '', toastTimer
 const pending = new Set()
+let assistant = null, assistantDraft = '', assistantError = '', assistantLoading = false, assistantSaving = false
+let assistantMessage = ''
 const kindIcon = kind => kind === 'gateway' ? 'cloud' : kind === 'ble' ? 'bluetooth' : 'wifi'
 const servicesFor = device => state.services.filter(item => item.deviceId === device.id)
 const serviceName = service => {
@@ -75,7 +77,7 @@ function deviceCard(device, detailed = false) {
   const battery = actual?.battery, large = device.board === 'waveshare-lcd-3.5'
   const metrics = ble?.metrics && Date.now() - ble.metrics.at < 5000 ? ble.metrics : null
   const batteryLabel = battery?.valid && battery.percent !== null ? `${battery.percent}%` : '—'
-  return `<article class="device-card"><div class="device-visual ${large ? 'large' : ''}"><span class="tag">${large ? '3.5″ / 320 × 480' : '1.54″ / 240 × 240'}</span><div class="mini-device">${face}</div><span class="visual-status"><span class="dot ${connected ? 'green' : ''}"></span>${connected ? '已连接' : '离线'}</span></div><div class="device-body"><h3>${escape(device.name)}<button class="icon-button" data-edit="${escape(device.id)}" aria-label="设置 ${escape(device.name)}" title="设备设置">${icon('settings')}</button></h3><p class="board-detail">Waveshare · ESP32-S3</p><div class="device-metadata"><span>${actual?.firmware ? `v${escape(actual.firmware)}` : '固件版本待读取'}</span>${large ? '<span>USB 供电</span>' : `<span class="battery" title="${connected ? '设备电量估算' : '上次连接的电量'}">${icon(battery?.charging ? 'bolt' : 'battery')}${connected ? '' : battery ? '上次 ' : ''}${batteryLabel}</span>`}</div><div class="device-divider"></div><div class="device-connect">${button(ble, ble.owned ? 'stop' : 'start', ble.owned ? '停止蓝牙' : '连接蓝牙')}<button class="button subtle" data-logs="${escape(ble.id)}">${icon('terminal')}日志</button></div>${detailed ? `<p class="device-note">${device.bleName ? escape(device.bleName) : '填写蓝牙名称后，即可连接这台设备。'}<br>Wi-Fi Bridge :${device.bridgePort} · ${escape(labels[bridge.state])}</p>${metrics ? `<div class="metrics-row"><span>麦克风<strong>${metrics.fps} fps</strong></span><span title="主机解码后的麦克风数据量，不是 BLE 无线链路速率">PCM 数据<strong>${metrics.kibPerSecond} KiB/s</strong></span></div>` : ''}` : ''}</div></article>`
+  return `<article class="device-card"><div class="device-visual ${large ? 'large' : ''}"><span class="tag">${large ? '3.5″ / 320 × 480' : '1.54″ / 240 × 240'}</span><div class="mini-device">${face}</div><span class="visual-status"><span class="dot ${connected ? 'green' : ''}"></span>${connected ? '已连接' : '离线'}</span></div><div class="device-body"><h3>${escape(device.name)}<button class="icon-button" data-edit="${escape(device.id)}" aria-label="设置 ${escape(device.name)}" title="设备设置">${icon('settings')}</button></h3><p class="board-detail">Waveshare · ESP32-S3</p><div class="device-metadata"><span>${actual?.firmware ? `v${escape(actual.firmware)}` : '固件版本待读取'}</span>${actual?.voiceMode ? `<span>${actual.voiceMode === 'wake' ? (actual.conversationActive ? '唤醒模式 · 对话中' : '唤醒模式 · 待唤醒') : '直接对话'}</span>` : ''}${large ? '<span>USB 供电</span>' : `<span class="battery" title="${connected ? '设备电量估算' : '上次连接的电量'}">${icon(battery?.charging ? 'bolt' : 'battery')}${connected ? '' : battery ? '上次 ' : ''}${batteryLabel}</span>`}</div><div class="device-divider"></div><div class="device-connect">${button(ble, ble.owned ? 'stop' : 'start', ble.owned ? '停止蓝牙' : '连接蓝牙')}<button class="button subtle" data-logs="${escape(ble.id)}">${icon('terminal')}日志</button></div>${detailed ? `<p class="device-note">${device.bleName ? escape(device.bleName) : '填写蓝牙名称后，即可连接这台设备。'}<br>Wi-Fi Bridge :${device.bridgePort} · ${escape(labels[bridge.state])}</p>${metrics ? `<div class="metrics-row"><span>麦克风<strong>${metrics.fps} fps</strong></span><span title="主机解码后的麦克风数据量，不是 BLE 无线链路速率">PCM 数据<strong>${metrics.kibPerSecond} KiB/s</strong></span></div>` : ''}` : ''}</div></article>`
 }
 function recentFeed() {
   const entries = state.logs.slice(-3).reverse()
@@ -108,6 +110,41 @@ function logsPage() {
   return pageHeader('每一次连接，都有迹可循。', '查看服务启停、连接变化与错误信息。日志只保留最近 600 条运行记录。')
     + `<section class="log-panel"><div class="log-toolbar"><input id="log-search" data-focus-key="log-search" aria-label="搜索日志" placeholder="搜索日志内容…" value="${escape(logSearch)}"><select id="log-service" data-focus-key="log-service" aria-label="按服务筛选"><option value="">全部服务</option><option value="manager" ${logService === 'manager' ? 'selected' : ''}>管理后台</option>${state.services.map(item => `<option value="${escape(item.id)}" ${logService === item.id ? 'selected' : ''}>${escape(serviceName(item.id))}</option>`).join('')}</select><span class="log-count" id="log-count"></span></div><div class="log-rows" id="log-rows"></div></section>`
 }
+function assistantPage() {
+  const introduction = pageHeader('一个熟悉的名字，一种喜欢的语气。', '设置它如何介绍自己、如何与你说话。大小屏共用这份助手设定。')
+  if (!assistant) return introduction + `<div class="banner" role="status">${escape(assistantError || '正在读取助手设定…')} ${assistantError ? '<button class="button secondary" data-action="reload-assistant">重新读取</button>' : ''}</div>`
+  return introduction + `<div class="assistant-layout"><section class="assistant-editor"><div class="section-header"><div><span class="eyebrow">ASSISTANT PROFILE</span><h2>名字、性格与说话方式</h2></div><span id="assistant-save-state" class="badge">已保存</span></div><form id="assistant-form"><label for="assistant-content">助手提示词<span class="assistant-field-hint">用自然语言描述即可，也可以先填入小智设定，再按你的喜好修改。</span></label><textarea id="assistant-content" name="content" rows="15" maxlength="8000" required spellcheck="false" aria-describedby="assistant-counter assistant-effect">${escape(assistantDraft)}</textarea><div class="assistant-editor-meta"><button type="button" class="button subtle" data-action="xiaozhi-template">${icon('plus')}填入小智设定</button><span id="assistant-counter" class="mono"></span></div><p id="assistant-effect" class="form-hint">保存后，在下一次语音会话中使用。立即应用会短暂断开并重连当前运行的设备。</p><p id="assistant-error" class="form-error hidden" role="alert"></p><p id="assistant-message" class="assistant-message hidden" role="status"></p><div class="assistant-actions"><button type="button" class="button secondary" data-action="reload-assistant">重新读取</button><span class="spacer"></span><button type="submit" class="button secondary" id="save-assistant">保存设定</button><button type="submit" class="button primary" id="apply-assistant" value="reconnect">${icon('refresh')}保存并重连</button></div></form></section><aside class="assistant-aside"><section class="assistant-example"><span class="eyebrow">A FAMILIAR VOICE</span><span class="assistant-example-face">&gt;_&lt;</span><h2>“你好小智”</h2><p class="assistant-bubble">我在，想聊点什么？</p><small>小智设定示例 · 非实时对话</small></section><section class="assistant-notes"><h3>${icon('info')}设定如何生效</h3><p>“小智”是你对它的称呼，Qwen 是它使用的技术。小智设定会让它自然接受这个名字；问到模型来源时仍如实回答。</p><p>设备唤醒词保持为<strong>“你好小智”</strong>。这里修改的是对话中的称呼和风格。</p><p>对话中明确保存的称呼偏好优先于这份默认设定。如果之前起过别的名字，可以在对话中说“以后叫你小智”。</p><p>保存到这台 Mac 的 Qwen 本机配置，使用同一配置的设备与对话控制台都会采用。${assistant.external ? '当前网关在外部运行，请确认它使用同一本机配置，并在原入口重连。' : ''}</p></section></aside></div>`
+}
+function updateAssistantControls() {
+  if (page !== 'assistant' || !assistant || !$('#assistant-content')) return
+  const dirty = assistantDraft !== assistant.content, count = [...assistantDraft].length
+  const busy = assistantSaving || assistantLoading
+  const valid = assistantDraft.trim() && count <= assistant.maxChars
+  const gateway = state.services.find(item => item.kind === 'gateway')
+  $('#assistant-save-state').textContent = busy ? '处理中…' : dirty ? '尚未保存' : '已保存'
+  $('#assistant-counter').textContent = `${count} / ${assistant.maxChars} 字符`
+  $('#assistant-content').disabled = busy
+  $('#save-assistant').disabled = offline || busy || !valid || !dirty
+  $('#apply-assistant').disabled = offline || busy || pending.size > 0 || !valid || !gateway?.owned
+  $('#apply-assistant').title = gateway?.owned ? '重连当前运行的设备以读取新设定' : '启动后台管理的网关后即可重连应用'
+  for (const action of ['reload-assistant', 'xiaozhi-template']) document.querySelectorAll(`[data-action="${action}"]`).forEach(button => { button.disabled = busy || offline })
+  $('#assistant-error').textContent = assistantError
+  $('#assistant-error').classList.toggle('hidden', !assistantError)
+  $('#assistant-message').textContent = assistantMessage
+  $('#assistant-message').classList.toggle('hidden', !assistantMessage)
+}
+async function loadAssistant() {
+  if (assistantLoading || assistantSaving) return
+  assistantLoading = true; assistantError = ''; assistantMessage = ''; updateAssistantControls()
+  try {
+    assistant = await request('/api/assistant')
+    assistantDraft = assistant.content
+  } catch (error) { assistantError = error.message }
+  finally {
+    assistantLoading = false
+    if (page === 'assistant') { $('#workspace').dataset.page = ''; render() }
+  }
+}
 let fullLogs = []
 function renderLogs() {
   if (page !== 'logs' || !$('#log-rows')) return
@@ -118,7 +155,12 @@ function renderLogs() {
 function render() {
   if (!state) return
   const focused = document.activeElement, focusKey = focused?.dataset.focusKey, position = focused?.selectionStart
-  $('#workspace').innerHTML = page === 'devices' ? devicesPage() : page === 'logs' ? logsPage() : overview()
+  // Poll service state without replacing a focused editor (including IME input).
+  const workspace = $('#workspace')
+  if (page !== 'assistant' || workspace.dataset.page !== 'assistant') {
+    workspace.innerHTML = page === 'devices' ? devicesPage() : page === 'logs' ? logsPage() : page === 'assistant' ? assistantPage() : overview()
+    workspace.dataset.page = page
+  }
   $('#nav-count').textContent = state.devices.length
   $('#breadcrumb-page').textContent = pageNames[page]
   document.querySelectorAll('[data-page]').forEach(link => link.classList.toggle('active', link.dataset.page === page))
@@ -129,6 +171,7 @@ function render() {
     if (position !== null && element?.setSelectionRange && element.type !== 'number') element.setSelectionRange(position, position)
   }
   renderLogs()
+  updateAssistantControls()
 }
 function notify(message, error = false) {
   const toast = $('#toast'); toast.textContent = message; toast.className = `toast${error ? ' error' : ''}`
@@ -176,6 +219,11 @@ document.addEventListener('click', async event => {
   if (!button || button.disabled) return
   if (button.dataset.action === 'close-dialog') return $('#device-dialog').close()
   if (button.dataset.action === 'add-device') return openDevice()
+  if (button.dataset.action === 'reload-assistant') return loadAssistant()
+  if (button.dataset.action === 'xiaozhi-template') {
+    assistantDraft = assistant.template; assistantError = ''; assistantMessage = ''
+    $('#assistant-content').value = assistantDraft; updateAssistantControls(); return
+  }
   if (button.dataset.edit) return openDevice(button.dataset.edit)
   if (button.dataset.logs) { logService = button.dataset.logs; location.hash = 'logs'; if (page === 'logs') { render(); void poll() }; return }
   if (button.dataset.command) {
@@ -187,6 +235,23 @@ document.addEventListener('click', async event => {
     } catch (error) { notify(error.message, true) }
     finally { pending.delete(id); render(); void poll() }
   }
+})
+document.addEventListener('submit', async event => {
+  if (event.target.id !== 'assistant-form') return
+  event.preventDefault()
+  if (!assistant || assistantSaving) return
+  const reconnect = event.submitter?.value === 'reconnect'
+  assistantSaving = true; assistantError = ''; assistantMessage = ''; updateAssistantControls()
+  try {
+    const result = await request('/api/assistant', 'PUT', { content: assistantDraft, revision: assistant.revision, reconnect })
+    assistant = result; assistantDraft = result.content
+    assistantError = result.applyError || ''
+    assistantMessage = result.applyError ? '' : result.reconnected > 0
+      ? '设定已保存，运行中的设备已重连；语音连接就绪后使用新设定。'
+      : '设定已保存，下次建立语音会话时使用。'
+    notify(assistantError || assistantMessage, Boolean(assistantError))
+  } catch (error) { assistantError = error.message }
+  finally { assistantSaving = false; updateAssistantControls(); void poll() }
 })
 $('#device-form').addEventListener('submit', async event => {
   event.preventDefault()
@@ -210,9 +275,19 @@ $('#delete-device').addEventListener('click', async () => {
   } catch (error) { $('#form-error').textContent = error.message; $('#form-error').classList.remove('hidden') }
   finally { button.disabled = false }
 })
-document.addEventListener('input', event => { if (event.target.id === 'log-search') { logSearch = event.target.value; renderLogs() } })
+document.addEventListener('input', event => {
+  if (event.target.id === 'log-search') { logSearch = event.target.value; renderLogs() }
+  if (event.target.id === 'assistant-content') { assistantDraft = event.target.value; assistantMessage = ''; updateAssistantControls() }
+})
 document.addEventListener('change', event => { if (event.target.id === 'log-service') { logService = event.target.value; renderLogs() } })
-function navigate() { page = Object.hasOwn(pageNames, location.hash.slice(1)) ? location.hash.slice(1) : 'overview'; render(); void poll() }
+function navigate() {
+  page = Object.hasOwn(pageNames, location.hash.slice(1)) ? location.hash.slice(1) : 'overview'
+  render(); void poll()
+  if (page === 'assistant' && !assistant) void loadAssistant()
+}
+window.addEventListener('beforeunload', event => {
+  if (assistant && assistantDraft !== assistant.content) { event.preventDefault(); event.returnValue = '' }
+})
 document.querySelectorAll('[data-icon]').forEach(element => { element.innerHTML = icon(element.dataset.icon) })
 window.addEventListener('hashchange', navigate)
 navigate()

@@ -171,6 +171,23 @@ bool frontend_test_guard_allows(void) { return echo_guard_allows_interruption();
     def test_echo_guard_one_percent_boundary_and_full_scale_products(self):
         self.run_scenario("echo-guard-boundary", 512)
 
+    def test_rejected_echo_cannot_prequalify_a_later_speech_candidate(self):
+        for chunk in (160, 256, 512):
+            with self.subTest(chunk=chunk): self.run_scenario("echo-guard-candidate", chunk)
+
+    def test_weak_speech_needs_longer_confirmation_without_disabling_it(self):
+        self.run_scenario("weak-speech", 512)
+
+    def test_weak_residual_cannot_prequalify_the_faster_strong_speech_path(self):
+        self.run_scenario("weak-to-strong", 512)
+
+    def test_speech_crossing_strength_thresholds_retains_sustained_evidence(self):
+        self.run_scenario("varying-weak-speech", 512)
+
+    def test_quiet_mic_does_not_promote_weak_reference_residual_to_fast_path(self):
+        for chunk in (160, 256, 512):
+            with self.subTest(chunk=chunk): self.run_scenario("weak-reference-residual", chunk)
+
     def test_history_and_pending_use_psram_with_full_sample_capacities(self):
         self.run_scenario("allocation-caps")
 

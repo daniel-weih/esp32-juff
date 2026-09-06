@@ -4,7 +4,8 @@ import { fileURLToPath } from 'node:url'
 import process from 'node:process'
 import { readConfig } from './config.mjs'
 import { createDeviceBridge } from './device-bridge.mjs'
-import { GatewayClient } from './gateway-client.mjs'
+import { ConversationClient } from './conversation-client.mjs'
+import { PlaybackDiagnostics } from './playback-diagnostics.mjs'
 
 const hostDirectory = fileURLToPath(new URL('..', import.meta.url))
 const qwenExecutable = fileURLToPath(new URL('../node_modules/.bin/qwenaudio', import.meta.url))
@@ -23,6 +24,9 @@ let bleMicWindowStartedAt = Date.now()
 let bleMicFrames = 0
 let bleMicBytes = 0
 let bleMicPeakRms = 0
+const playbackDiagnostics = new PlaybackDiagnostics({
+  report: metrics => process.stdout.write(`BLE PLAYBACK ${JSON.stringify(metrics)}\n`),
+})
 
 function delay(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds))
@@ -88,6 +92,7 @@ const BLE_GATEWAY_EVENTS = new Set([
   'input.resume',
   'voice.state',
   'error',
+  'conversation.ack',
 ])
 
 function sendToBle(message) {
@@ -96,6 +101,7 @@ function sendToBle(message) {
 }
 
 function closeBleVoice() {
+  playbackDiagnostics.clear()
   const client = bleGateway
   bleGateway = null
   client?.close()
@@ -106,7 +112,7 @@ async function startBleVoice() {
   if (bleGatewayStarting) return bleGatewayStarting
 
   bleGatewayStarting = (async () => {
-    const client = new GatewayClient({
+    const client = new ConversationClient({
       baseUrl: config.gatewayUrl,
       sessionId: `${config.gatewaySessionId}-ble`,
       takeover: true,
@@ -117,6 +123,7 @@ async function startBleVoice() {
     bleGateway = client
     let activeResponseId = ''
     client.on('event', event => {
+      playbackDiagnostics.source(event)
       // Managed workers expose operational logs only; a transcript can contain
       // newlines and must be excluded before the manager splits stdout into lines.
       if (event?.type === 'transcript.final' && config.serviceMode === 'all') {
@@ -143,6 +150,8 @@ async function startBleVoice() {
             type: 'audio.begin',
             responseId,
             sampleRate: Number(event.sampleRate) || 24000,
+            ...(event.conversationGeneration === undefined ? {}
+              : { conversationGeneration: event.conversationGeneration }),
           })
           process.stdout.write(`QWEN EVENT audio.begin: ${responseId}\n`)
         }
@@ -156,8 +165,6 @@ async function startBleVoice() {
     })
     client.on('close', (code, reason) => {
       if (bleGateway === client) {
-        bleGateway = null
-        sendToBle({ type: 'voice.deactivated' })
         if (!stopping) {
           process.stderr.write(`BLE Qwen session closed (${code} ${reason})\n`)
         }
@@ -165,7 +172,13 @@ async function startBleVoice() {
     })
 
     try {
+      // New firmware replies to status with its local mode. Give that handshake
+      // a turn before activating a cloud session; legacy firmware still starts.
+      sendToBle({ type: 'status' })
+      await delay(350)
+      if (bleGateway !== client || stopping) return
       const health = await client.connect()
+      if (!health || bleGateway !== client || stopping) return
       sendToBle({
         type: 'device.ready',
         realtimeModel: health.realtimeModel || health.realtimeModelProfile?.id || '',
@@ -175,7 +188,7 @@ async function startBleVoice() {
         transportCodec: 'g711-mulaw',
       })
       process.stdout.write(
-        `BLE voice ready: ${health.realtimeModel || 'Qwen Realtime'} via ESP32 microphone/speaker\n`,
+        `BLE voice bridge connected: ${health.realtimeModel || 'Qwen Realtime'} via ESP32 microphone/speaker\n`,
       )
     } catch (error) {
       if (bleGateway === client) bleGateway = null
@@ -225,6 +238,8 @@ function handleBleLine(line) {
     process.stdout.write(`BLE ${line}\n`)
     try {
       const event = JSON.parse(line.slice(7))
+      playbackDiagnostics.device(event)
+      if (event?.type === 'conversation.state') bleGateway?.setConversation(event)
       if (BLE_DEVICE_EVENTS.has(event?.type)) bleGateway?.send(event)
     } catch {
       // Human-readable device output can be ignored when it is not JSON.

@@ -30,13 +30,13 @@ export function createManagerServer(manager, { publicDirectory, port = 3210 } = 
     response.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
     response.end(JSON.stringify(body))
   }
-  async function body(request) {
+  async function body(request, limit = 16384) {
     if (request.headers['content-type']?.split(';')[0] !== 'application/json') throw new ManagerError('需要 JSON 请求', 415)
     const chunks = []
     let size = 0
     for await (const chunk of request) {
       size += chunk.length
-      if (size > 16384) throw new ManagerError('请求内容过大', 413)
+      if (size > limit) throw new ManagerError('请求内容过大', 413)
       chunks.push(chunk)
     }
     const data = Buffer.concat(chunks).toString('utf8')
@@ -60,6 +60,7 @@ export function createManagerServer(manager, { publicDirectory, port = 3210 } = 
     const url = new URL(request.url, origin)
     if (request.method === 'GET') {
       if (url.pathname === '/api/state') return json(response, 200, { ...manager.snapshot(), csrfToken })
+      if (url.pathname === '/api/assistant') return json(response, 200, await manager.readAssistant())
       if (url.pathname === '/api/logs') return json(response, 200, { entries: manager.logs.read({
         service: url.searchParams.get('service'), after: Math.max(0, Number(url.searchParams.get('after')) || 0),
       }) })
@@ -72,7 +73,8 @@ export function createManagerServer(manager, { publicDirectory, port = 3210 } = 
     const token = Buffer.from(String(request.headers['x-juff-csrf'] || ''))
     const expected = Buffer.from(csrfToken)
     if (request.headers.origin !== origin || token.length !== expected.length || !timingSafeEqual(token, expected)) throw new ManagerError('页面会话已失效，请刷新后重试', 403)
-    const input = await body(request)
+    const input = await body(request, url.pathname === '/api/assistant' ? 32768 : 16384)
+    if (url.pathname === '/api/assistant' && request.method === 'PUT') return json(response, 200, await manager.saveAssistant(input))
     const action = /^\/api\/services\/([a-z0-9-]+)\/(start|stop|restart)$/.exec(url.pathname)
     if (action && request.method === 'POST') return json(response, 200, await manager.command(action[1], action[2]))
     if (url.pathname === '/api/devices' && request.method === 'POST') {

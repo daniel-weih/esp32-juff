@@ -5,6 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { readConfig } from '../config.mjs'
 import { LogStore, readLines } from './logs.mjs'
 import { ManagerError } from './profiles.mjs'
+import { AssistantProfileStore } from './assistant.mjs'
 
 const active = record => Boolean(record.child) || record.state === 'external'
 const text = (value, max = 80) => typeof value === 'string' ? value.slice(0, max) : ''
@@ -13,7 +14,7 @@ const number = value => typeof value === 'number' && Number.isFinite(value) ? va
 export class ServiceManager {
   constructor({ root, store, env = process.env, spawnImpl = spawn, fetchImpl = fetch,
     now = Date.now, startTimeout = 12000, stopTimeout = 5000, pollDelay = 150,
-    signalImpl = (child, signal) => process.kill(-child.pid, signal), checkFiles = true }) {
+    signalImpl = (child, signal) => process.kill(-child.pid, signal), checkFiles = true, assistantStore }) {
     Object.assign(this, { root, store, env, spawnImpl, fetchImpl, now, startTimeout, stopTimeout, pollDelay, signalImpl, checkFiles })
     this.logs = new LogStore({ secrets: [env.JUFF_DEVICE_TOKEN, env.DASHSCOPE_API_KEY], now })
     this.records = new Map()
@@ -21,6 +22,7 @@ export class ServiceManager {
     this.startedAt = now()
     this.closing = false
     this.refreshing = null
+    this.assistantStore = assistantStore || new AssistantProfileStore({ env })
     this.syncRecords()
   }
 
@@ -142,6 +144,8 @@ export class ServiceManager {
           record.device = {
             firmware: text(event.firmware), board: text(event.board), playing: event.playing === true,
             voiceInterrupt: event.voiceInterrupt === true, speakerFlow: event.speakerFlow === 1,
+            voiceMode: ['continuous', 'wake'].includes(event.voiceMode) ? event.voiceMode : null,
+            conversationActive: event.conversationActive === true,
             battery: event.battery ? { valid: event.battery.valid === true, percent: number(event.battery.percent), charging: event.battery.charging === true } : null,
             seenAt: this.now(),
           }
@@ -301,6 +305,48 @@ export class ServiceManager {
       this.syncRecords()
       this.logs.add('manager', '设备配置已保存')
       return this.snapshot()
+    })
+  }
+  assistantStatus() {
+    const gateway = this.record('gateway')
+    const url = this.gatewayURL() && new URL(this.gatewayURL())
+    const local = url?.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname)
+    return { local, canReconnect: Boolean(local && gateway.child),
+      runningConnections: [...this.records.values()].filter(item => item.kind !== 'gateway' && item.child).length,
+      external: gateway.state === 'external' }
+  }
+  async readAssistant() {
+    if (!this.assistantStatus().local) throw new ManagerError('当前使用外部网关，请在运行 Qwen 的主机上修改助手设定', 409)
+    return { ...await this.assistantStore.read(), ...this.assistantStatus() }
+  }
+  saveAssistant(input) {
+    return this.exclusive(async () => {
+      await this.refresh()
+      const status = this.assistantStatus()
+      if (!status.local) throw new ManagerError('当前使用外部网关，请在运行 Qwen 的主机上修改助手设定', 409)
+      if (input.reconnect && !status.canReconnect) throw new ManagerError('当前网关由外部管理或尚未启动，请仅保存并在下次连接时使用', 409)
+      const saved = await this.assistantStore.save(input)
+      this.logs.add('manager', '助手设定已保存，下次建立语音会话时读取')
+      let reconnected = 0, applyError = null
+      if (input.reconnect) {
+        // Recreate only the already running connections. Do not start stopped
+        // devices or restart the gateway; a new voice session reloads the file.
+        const connections = [...this.records.values()].filter(item => item.kind !== 'gateway' && item.child)
+        const stopped = []
+        for (const item of connections) {
+          try { await this.stop(item); stopped.push(item) } catch { applyError = true }
+        }
+        for (const item of stopped) {
+          try { await this.start(item); reconnected++ } catch { applyError = true }
+        }
+        if (applyError) {
+          applyError = '设定已保存，但部分连接未恢复，请在服务总览检查并重新连接'
+          this.logs.add('manager', applyError, 'error')
+        } else if (reconnected) {
+          this.logs.add('manager', '已重连运行中的设备服务，以读取新的助手设定')
+        }
+      }
+      return { ...saved, ...this.assistantStatus(), reconnected, applyError }
     })
   }
   async close() {

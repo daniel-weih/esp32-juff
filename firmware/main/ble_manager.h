@@ -1,5 +1,8 @@
 #pragma once
 
+void ble_manager_reset_conversation(void);
+void ble_manager_send_conversation_state(void);
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>

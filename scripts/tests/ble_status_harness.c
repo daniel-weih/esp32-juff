@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "voice_session_stubs.h"
 
 #include "battery_monitor.h"
 #include "board_config.h"

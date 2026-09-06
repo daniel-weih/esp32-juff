@@ -66,6 +66,30 @@ The custom service uses these UUIDs:
 Control messages are newline-delimited JSON with a maximum encoded size of
 512 bytes.
 
+## Conversation lifetime and shared voice ownership
+
+Firmware publishes `conversation.state` with its LIVE / WAKE mode, active flag
+and generation; the host replies with `conversation.ack`. Each transition
+retires the previous cloud client and tags control messages with the current
+generation. WAKE standby keeps microphone audio local. Playback and detected
+speech renew a 180-second idle deadline; expiry closes the cloud conversation
+and requires another local wake. Mac-generated playback failure clears carry
+the same generation as forwarded cloud controls.
+
+Qwen `1.11.0` arbitrates one active voice client per owner, independently of
+the `sessionId`. A busy or deactivated client can retain its WebSocket while
+its audio frontend is disabled. On `voice.ownership: available`, a waiting
+JUFF client sends one new `connect` request on that socket with `takeover: false`.
+Duplicate notices cannot submit concurrent claims. Competing clients
+therefore resume after release without taking the slot from another holder.
+Initial connection policy remains separate from this recovery request.
+
+Explicit mute/sleep disables automatic recovery, input mute survives a claim,
+and closing a conversation cancels all future claims from its old socket.
+The device receives `voice.ready` only when the audio frontend becomes ready;
+opening a local WebSocket alone does not establish speech readiness. A cached
+wake acknowledgement plays at most once per wake, including ownership recovery.
+
 ## Audio formats and flow control
 
 The ES8311 side uses 24 kHz, signed PCM16 little-endian, mono.
@@ -87,6 +111,15 @@ adds `flowControl: 1` and a nonzero `streamId` to `audio.begin`, then waits for
 `speaker.credit` before sending audio. Every speaker packet starts with two
 little-endian 32-bit words: the stream ID and the μ-law byte offset, followed
 by the encoded audio. `audio.done` carries the same stream ID.
+
+For this credit-based transport, JuffBLE caps each GATT write value at 244
+bytes (including its 8-byte stream header), while respecting a smaller
+CoreBluetooth limit. JUFF requests a 251-byte link payload; the 4-byte L2CAP
+header and 3-byte ATT write header leave 244 bytes for the value. A 253-byte
+value permitted by an ATT MTU of 256 otherwise spans two link packets.
+This avoids the short second fragment without changing the codec, sample
+rate, receive window or send-rate policy. See the
+[ESP-IDF packet layout](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-guides/ble/get-started/ble-connection.html#maximum-transmission-unit).
 
 Credits carry `responseId`, `streamId`, `received`, `limit`, and `state`.
 `received` is the accepted μ-law byte count; `limit` is the cumulative upper

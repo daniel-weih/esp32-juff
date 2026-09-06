@@ -6,7 +6,7 @@
 | :---: | :---: |
 | <img src="docs/images/juff-ui-3.5.png" alt="JUFF firmware UI for the large display" width="320"> | <img src="docs/images/juff-ui-1.54.png" alt="JUFF firmware UI for the small display" width="240"> |
 
-*Rendered from the `0.6.10-dev` firmware UI at each display's native resolution; the small display's 78% battery reading is illustrative.*
+*Rendered from the `0.7.0-dev` firmware UI at each display's native resolution; the small display's battery reading is illustrative.*
 
 JUFF turns the Waveshare **ESP32-S3-Touch-LCD-3.5 / 1.54** into a touch-enabled,
 real-time voice terminal. Its default transport is encrypted Bluetooth LE:
@@ -37,14 +37,18 @@ enabling experimental voice interruption through the
 The `features.voice_interrupt` and `aec_reference` fields in a package's
 `manifest.json` record its actual setting and hardware reference path.
 
-The [validation record](docs/voice-interruption-validation.md) retains failures
-and one calibrated smoke-test pass from `0.6.0-dev`; these results do not
-establish acoustic acceptance.
-Version `0.6.2-dev` introduced the large board's ES8311 digital-reference
-integration. The current development version is `0.6.10-dev`; temporary
-display diagnostics were removed in `0.6.3-dev`. Recovery from the large board's reported black screen
-has not been confirmed on the physical device; earlier acoustic results do
-not establish display acceptance. See the [large-board AEC record](docs/waveshare-lcd-3.5-aec-feasibility.md).
+The [validation record](docs/voice-interruption-validation.md) retains historical
+failures and controlled results after each correction, including long playback
+and deliberate interruptions on `0.7.0-dev`. The latest two-board checks passed
+long playback and complete recognition of a fixed phrase after eight interruptions.
+Human speech across acoustic environments still needs broader validation;
+the record also describes playback limits on low-throughput links.
+Both physical boards now run `0.7.0-dev` and have passed paired BLE, local audio
+self-tests and synthetic-wake acknowledgement checks. Large-board startup logs
+confirm the first LCD transfer and touch initialization; driver logs do not
+replace visual display acceptance. See the [large-board AEC record](docs/waveshare-lcd-3.5-aec-feasibility.md)
+for historical black-screen investigation and the [wake-mode record](docs/voice-wake.md)
+for current installation evidence.
 
 Version `0.6.8-dev` adds up to four seconds of device audio buffering and BLE
 receiver credits. Playback starts with a 300 ms prefill; excess synthesized audio
@@ -69,12 +73,32 @@ without remaining-capacity calibration for the installed cell.
 
 *Small-display charging preview; the large display omits unsupported battery readings.*
 
+## Voice wake mode
+
+Tap **LIVE / WAKE** on either device to choose continuous conversation or offline
+wake-word mode. The choice persists across reboots; LIVE remains the default.
+In WAKE mode, say **“你好小智” (nǐ hǎo xiǎo zhì)** and wait for **“我在”** (“I'm here”)
+before asking a question. This cached local greeting plays when cloud voice input
+is ready. After **3 minutes without conversation**, the voice session
+closes and requires another wake word. Standby microphone audio stays on-device.
+The existing interruption configuration is independent of this setting.
+
+See [mode screenshots and update instructions](docs/voice-wake.md). Update the
+host, Mac BLE helper, and the correct board firmware, including its model image.
+Human-speaker wake accuracy across distances and environments remains unvalidated.
+
 ## WebUI service dashboard
 
 Run `make admin` and open <http://127.0.0.1:3210/> on the Mac to manage the
 gateway and device connections. The desktop widescreen layout places service
 controls beside device information. It shares JUFF's soft colors and abstract
 expressions, with separate profiles for both screen sizes.
+
+A Qwen owner has one active voice slot at a time, while multiple device services
+can remain connected. Waiting devices automatically request the free slot after
+the holder stops, disconnects or ends its wake conversation. A device whose WAKE
+session has already timed out still requires a fresh wake. See the dashboard
+guide for initial takeover policy and recovery behavior.
 
 <img src="docs/images/juff-admin-overview.jpg" alt="JUFF service dashboard showing process controls, both device profiles and recent events with demonstration data" width="1000">
 
@@ -84,11 +108,15 @@ expressions, with separate profiles for both screen sizes.
 | --- | --- |
 | Overview (服务总览) | Gateway and per-device service status, model, process ID, uptime and individual start/stop/restart controls |
 | Devices (我的设备) | Separate Bluetooth bindings, ports and sessions; connected device firmware, small-screen battery and audio metrics |
+| Assistant (助手设定) | Edit Qwen's default name, personality and speaking style; fill the Xiaozhi preset, save, or save and reconnect active device services |
 | Logs (运行日志) | Recent connection, lifecycle and error events, filterable by service and text |
 
 Opening the dashboard leaves voice services stopped. Start All launches the
 gateway and bound BLE devices; Wi-Fi bridges can be started individually.
 Stopping or restarting the gateway also handles its managed connection workers.
+Assistant settings use Qwen's private local `ASSISTANT.md` and apply to new voice
+sessions on both devices. The preset accepts “Xiaozhi” as the assistant's nickname
+while acknowledging Qwen as its technology; the firmware wake phrase stays unchanged.
 See the [UI guide and widescreen preview](docs/service-manager.md#界面导览).
 
 ## Set up a new Mac

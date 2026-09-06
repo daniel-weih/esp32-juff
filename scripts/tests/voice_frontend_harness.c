@@ -346,6 +346,10 @@ static void test_gates(void)
     feed_frames(11, 800, true, true, true);
     assert(interrupt_calls == 0);
     feed_frames(1, 800, true, true, true);
+    // Replace enough of the small-board echo window for strong evidence;
+    // preceding rejected/weak frames cannot pre-fill fast confirmation.
+    if (CONFIG_JUFF_BOARD_WAVESHARE_LCD_154)
+        feed_frames(8, 800, true, true, true);
     assert(interrupt_calls == 1);
     feed_frames(50, 800, true, true, true);
     assert(interrupt_calls == 1 && uploaded_count == 0);
@@ -752,6 +756,97 @@ static void test_echo_guard_boundary(void)
     assert(interrupt_calls == 0);
 }
 
+static void test_echo_guard_candidate(void)
+{
+    override_aec_clean = true;
+    forced_aec_clean = 300;
+    vad_result = VAD_SPEECH;
+    // A sustained residual can satisfy VAD and the absolute energy floor,
+    // while the complete AEC window correctly identifies it as echo.
+    for (unsigned frame = 0; frame < 100; ++frame)
+        feed(INPUT_FRAME, 10000, 1000, true, false, true);
+    if (!CONFIG_JUFF_BOARD_WAVESHARE_LCD_154) {
+        assert(interrupt_calls == 1); // Large-board policy is independent.
+        return;
+    }
+    assert(interrupt_calls == 0 && !frontend_test_guard_allows());
+    forced_aec_clean = 500;
+    // Replace the echo window with near-end speech. The final bucket is the
+    // first qualifying evidence: rejected echo must not pre-fill its 120 ms.
+    fill_echo_guard(1000, 1000);
+    assert(frontend_test_guard_allows() && interrupt_calls == 0);
+    // Include one bucket for a partial input block to leave the energy window,
+    // then a complete strong-speech candidate.
+    for (unsigned block = 0; block < (1920U + 640U + chunk_size - 1U) / chunk_size; ++block)
+        feed((size_t)chunk_size * 3 / 2, 1000, 1000, true, false, true);
+    assert(interrupt_calls == 1);
+}
+
+static void test_weak_speech(bool strengthens)
+{
+    override_aec_clean = true;
+    forced_aec_clean = 300;
+    for (unsigned frame = 0; frame < 60; ++frame)
+        feed(INPUT_FRAME, 2500, 1000, true, false, true);
+    vad_result = VAD_SPEECH;
+    for (unsigned frame = 0; frame < 20; ++frame)
+        feed(INPUT_FRAME, 2500, 1000, true, false, true);
+    if (!CONFIG_JUFF_BOARD_WAVESHARE_LCD_154) {
+        assert(interrupt_calls == 1);
+        return;
+    }
+    assert(interrupt_calls == 0 && "A brief 1.44% residual must not interrupt");
+    if (strengthens) {
+        forced_aec_clean = 500;
+        fill_echo_guard(1000, 1000);
+        assert(interrupt_calls == 0 && "Weak evidence must not pre-fill the strong path");
+    }
+    for (unsigned frame = 0; frame < 36; ++frame)
+        feed(INPUT_FRAME, strengthens ? 1000 : 2500, 1000, true, false, true);
+    assert(interrupt_calls == 1);
+    // Strong input may complete the independent 360 ms path before it has
+    // provided 120 ms above the stronger threshold.
+    assert(interrupt_telemetry_value("qualified_ms=") == 360U);
+}
+
+static void test_varying_weak_speech(void)
+{
+    override_aec_clean = true;
+    forced_aec_clean = 300;
+    for (unsigned frame = 0; frame < 60; ++frame)
+        feed(INPUT_FRAME, 2500, 1000, true, false, true);
+    vad_result = VAD_SPEECH;
+    for (unsigned block = 0; block < 30; ++block) {
+        // Both levels are valid near-end candidates. Crossing the 5% boundary
+        // may reset the fast path, but must not erase sustained weak evidence.
+        forced_aec_clean = block % 8 < 4 ? 300 : 750;
+        feed((size_t)chunk_size * 3 / 2, 2500, 1000, true, false, true);
+    }
+    assert(interrupt_calls == 1);
+}
+
+static void test_weak_reference_residual(void)
+{
+    // A quiet MIC makes clean/MIC power look strong even though the residual
+    // is small beside the active speaker reference (e.g. at a response tail).
+    override_aec_clean = true;
+    forced_aec_clean = 300;
+    for (unsigned frame = 0; frame < 60; ++frame)
+        feed(INPUT_FRAME, 400, 1200, true, false, true);
+    vad_result = VAD_SPEECH;
+    for (unsigned frame = 0; frame < 20; ++frame)
+        feed(INPUT_FRAME, 400, 1200, true, false, true);
+    if (!CONFIG_JUFF_BOARD_WAVESHARE_LCD_154) {
+        assert(interrupt_calls == 1);
+        return;
+    }
+    assert(interrupt_calls == 0 && "Small residual must not become strong because MIC is quiet");
+    for (unsigned frame = 0; frame < 36; ++frame)
+        feed(INPUT_FRAME, 400, 1200, true, false, true);
+    assert(interrupt_calls == 1 && "Sustained quiet speech must remain eligible");
+    assert(interrupt_telemetry_value("qualified_ms=") == 360U);
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 3);
@@ -780,6 +875,11 @@ int main(int argc, char **argv)
     else if (strcmp(argv[1], "echo-guard-quiet") == 0) test_echo_guard_speech(false, true);
     else if (strcmp(argv[1], "echo-guard-window") == 0) test_echo_guard_window();
     else if (strcmp(argv[1], "echo-guard-boundary") == 0) test_echo_guard_boundary();
+    else if (strcmp(argv[1], "echo-guard-candidate") == 0) test_echo_guard_candidate();
+    else if (strcmp(argv[1], "weak-speech") == 0) test_weak_speech(false);
+    else if (strcmp(argv[1], "weak-to-strong") == 0) test_weak_speech(true);
+    else if (strcmp(argv[1], "varying-weak-speech") == 0) test_varying_weak_speech();
+    else if (strcmp(argv[1], "weak-reference-residual") == 0) test_weak_reference_residual();
     else if (strcmp(argv[1], "gates") == 0) test_gates();
     else if (strcmp(argv[1], "spikes") == 0) test_spikes();
     else if (strcmp(argv[1], "candidate-mute") == 0) test_candidate_mute();
