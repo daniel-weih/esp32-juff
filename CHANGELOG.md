@@ -7,6 +7,28 @@ All notable changes to JUFF are documented here. The project follows
 
 Current firmware development version: `0.6.10-dev`.
 
+### Local service management dashboard
+
+- Add `make admin` and a local JUFF dashboard on port 3210, independent of voice
+  services. Manage the shared gateway and each device's BLE and Wi-Fi workers.
+- Track process health, device connection, firmware, battery and audio metrics;
+  display bounded, credential-redacted operational logs.
+- Store up to eight hardware-specific device profiles in private, ignored local
+  configuration. Validate unique Bluetooth bindings, ports and session IDs.
+- Serialize lifecycle operations, stop owned child process groups, preserve
+  dependencies during gateway restart, and observe external services without
+  stopping them. Keep the existing direct voice startup command compatible.
+- Restrict the management listener to loopback and protect control requests
+  with exact Host/Origin checks and a per-process anti-CSRF token.
+- Restore surviving BLE and Bridge workers when Start All recovers a crashed
+  gateway; preserve Chinese device names across split UTF-8 request chunks.
+- Omit transcripts at the managed worker's source so multiline speech cannot
+  leak into operational logs. Verify this with an isolated worker and test gateway.
+- Arrange desktop service controls and device information side by side, with
+  responsive device cards that use the available screen width.
+- Add 16:9 desktop dashboard and device-page screenshots, Chinese and English UI
+  introductions, and a read-only preview using synthetic data for public images.
+
 ### 0.6.10-dev transport review fixes
 
 - Serialize BLE credit snapshots through notification publication so concurrent

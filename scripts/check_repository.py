@@ -11,7 +11,7 @@ import sys
 REQUIRED = ("LICENSE", "README.md", "CONTRIBUTING.md", "SECURITY.md",
             "host/.env.example", "host/package-lock.json")
 ARTIFACT_DIRS = {"node_modules", "build", "managed_components", "backups", "dist",
-                 "tmp", ".tools", ".venv", "__pycache__", "DerivedData", "coverage"}
+                 "tmp", ".tools", ".venv", ".local", "__pycache__", "DerivedData", "coverage"}
 ARTIFACT_SUFFIXES = {".bin", ".elf", ".o", ".a", ".zip", ".pyc", ".pyo"}
 RULES = {
     "machine-specific absolute path": re.compile(

@@ -19,8 +19,10 @@ passwords, device tokens, BLE bonding data, or full flash dumps.
 
 - DashScope credentials belong in `~/.config/qwaudio/config.env` (or the
   equivalent path under `$XDG_CONFIG_HOME`) only.
-- `host/.env`, `firmware/sdkconfig`, NVS dumps, and `backups/` are ignored.
+- `host/.env`, `host/.local/`, `firmware/sdkconfig`, NVS dumps, and `backups/` are ignored.
 - The Qwen Gateway binds to loopback by default.
+- The JUFF management dashboard binds to loopback only and requires same-origin,
+  anti-CSRF-protected control requests. It is not a remote administration service.
 - The Wi-Fi Bridge must use a unique random device token before it is exposed
   to a LAN.
 - Rotate any credential that was pasted into an issue, log, chat, or commit.

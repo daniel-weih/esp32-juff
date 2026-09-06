@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f5f0">
+  <title>JUFF · 服务管理</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" type="module"></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="#overview" aria-label="JUFF 首页"><span class="brand-face">&gt;_&lt;</span><span>juff<span class="brand-dot">.</span></span></a>
+    <p class="sidebar-caption">让连接，简单一点。</p>
+    <div class="nav-label">工作空间</div>
+    <nav aria-label="主导航">
+      <a href="#overview" data-page="overview"><span data-icon="grid"></span>服务总览</a>
+      <a href="#devices" data-page="devices"><span data-icon="device"></span>我的设备<span id="nav-count" class="nav-count">2</span></a>
+      <a href="#logs" data-page="logs"><span data-icon="terminal"></span>运行日志</a>
+    </nav>
+    <div class="sidebar-bottom"><span class="host-mark" data-icon="monitor"></span><div><strong>这台 Mac</strong><small>本机管理 · 127.0.0.1</small></div><span class="dot green"></span></div>
+  </aside>
+  <div class="shell">
+    <header class="topbar"><span class="breadcrumb">JUFF 工作空间 <span>/</span> <b id="breadcrumb-page">服务总览</b></span><div id="connection-status" class="connection-status"><span class="dot amber"></span>正在连接</div></header>
+    <main>
+      <div id="connection-error" class="banner hidden" role="status"></div>
+      <div id="workspace" aria-live="off"><div class="loading">正在读取本机服务…</div></div>
+      <footer><span><span class="tiny-face">&gt;_&lt;</span> a little presence.</span><span id="last-updated">JUFF 服务管理</span></footer>
+    </main>
+  </div>
+  <div id="toast" class="toast hidden" role="status"></div>
+  <dialog id="device-dialog" aria-labelledby="dialog-title">
+    <div class="dialog-header"><div><span class="eyebrow">DEVICE SETTINGS</span><h2 id="dialog-title">设备设置</h2></div><button type="button" class="icon-button" data-action="close-dialog" aria-label="关闭设置"><span data-icon="close"></span></button></div>
+    <form id="device-form">
+      <label>设备名称<input name="name" maxlength="40" required placeholder="给你的小伙伴起个名字" autofocus></label>
+      <label>硬件型号<select name="board"><option value="waveshare-lcd-1.54">1.54 英寸 · 240 × 240</option><option value="waveshare-lcd-3.5">3.5 英寸 · 320 × 480</option></select></label>
+      <label>蓝牙名称<input name="bleName" maxlength="64" placeholder="JUFF-XXXX" spellcheck="false"><small>查看设备屏幕的蓝牙连接页。仅使用 Wi-Fi 时可留空。</small></label>
+      <div class="form-row"><label>Bridge 端口<input name="bridgePort" type="number" min="1024" max="65535" required></label><label>会话编号<input name="sessionId" maxlength="48" pattern="[a-zA-Z0-9_-]+" required spellcheck="false"></label></div>
+      <p class="form-hint">每台设备使用独立的端口与会话。修改配置前，请先停止该设备的连接服务。</p>
+      <p id="form-error" class="form-error hidden" role="alert"></p>
+      <div class="dialog-actions"><button type="button" class="button subtle danger" id="delete-device">移除设备</button><span class="spacer"></span><button type="button" class="button secondary" data-action="close-dialog">取消</button><button type="submit" class="button primary" id="save-device">保存配置</button></div>
+    </form>
+  </dialog>
+</body>
+</html>

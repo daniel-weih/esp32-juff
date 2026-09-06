@@ -117,7 +117,9 @@ async function startBleVoice() {
     bleGateway = client
     let activeResponseId = ''
     client.on('event', event => {
-      if (event?.type === 'transcript.final') {
+      // Managed workers expose operational logs only; a transcript can contain
+      // newlines and must be excluded before the manager splits stdout into lines.
+      if (event?.type === 'transcript.final' && config.serviceMode === 'all') {
         process.stdout.write(
           `QWEN ${event.role || 'voice'}: ${event.content || event.text || ''}\n`,
         )
@@ -283,6 +285,9 @@ process.once('SIGTERM', () => void stop('SIGTERM'))
 try {
   let health = await gatewayHealth()
   if (!health) {
+    if (config.serviceMode !== 'all') {
+      throw new Error('Qwen Gateway is unavailable; start it from the JUFF manager first')
+    }
     gateway = spawn(qwenExecutable, [], {
       cwd: hostDirectory,
       stdio: 'inherit',
@@ -300,12 +305,15 @@ try {
     health = await waitForGateway()
   }
 
-  startBleCompanion()
-  bridge = createDeviceBridge(config)
-  await bridge.start()
+  if (config.serviceMode !== 'bridge') startBleCompanion()
+  if (config.serviceMode !== 'ble') {
+    bridge = createDeviceBridge(config)
+    await bridge.start()
+  }
   process.stdout.write(
     `Juff ready: ${health.realtimeModel || 'Qwen Realtime'}; `
-      + `ESP32 bridge ws://${config.bridgeHost}:${config.bridgePort}${config.devicePath}\n`,
+      + (bridge ? `ESP32 bridge ws://${config.bridgeHost}:${config.bridgePort}${config.devicePath}` : 'BLE only')
+      + '\n',
   )
 } catch (error) {
   process.stderr.write(`Juff startup failed: ${error.message}\n`)

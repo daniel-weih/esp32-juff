@@ -9,6 +9,7 @@
 .env.*
 !.env.example
 host/.env
+host/.local/
 *.key
 *.pem
 

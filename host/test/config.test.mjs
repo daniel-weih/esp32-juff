@@ -13,6 +13,14 @@ test('accepts a private device token', () => {
   const config = readConfig(environment('7f5e24a341b84dd78b5c6f48'))
   assert.equal(config.bridgeHost, '127.0.0.1')
   assert.equal(config.bridgePort, 8765)
+  assert.equal(config.serviceMode, 'all')
+})
+
+test('isolated management workers accept only explicit BLE and Bridge modes', () => {
+  for (const serviceMode of ['ble', 'bridge']) {
+    assert.equal(readConfig({ ...environment('synthetic-device-token'), JUFF_SERVICE_MODE: serviceMode }).serviceMode, serviceMode)
+  }
+  assert.throws(() => readConfig({ ...environment('synthetic-device-token'), JUFF_SERVICE_MODE: 'shell' }), /JUFF_SERVICE_MODE/)
 })
 
 test('rejects short and placeholder device tokens', () => {

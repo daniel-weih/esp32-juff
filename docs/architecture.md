@@ -29,6 +29,19 @@ on the Mac.
 Qwen Gateway, starts JuffBLE, creates the optional Device Bridge, and shuts all
 children down when it receives SIGINT or SIGTERM.
 
+`make admin` instead runs `host/src/admin.mjs` and an independent loopback-only
+dashboard on port 3210. Its supervisor starts the shared Qwen gateway and
+per-device `run.mjs` workers with `JUFF_SERVICE_MODE=ble` or `bridge`. These
+workers require a running gateway and do not start their own. The legacy
+default mode, `all`, keeps the original direct startup behavior.
+
+Each device profile has an explicit hardware model, Bluetooth name, Bridge port
+and session ID. The manager stores these in ignored `host/.local/devices.json`
+with private permissions. It owns only child processes it spawned, serializes
+operations, and stops dependent workers before the shared gateway. External
+gateway and Bridge health is visible without acquiring process ownership.
+See [service management](service-manager.md) for the HTTP API and boundaries.
+
 ## BLE transport
 
 The ESP32 is a NimBLE peripheral named `JUFF-XXXX`; the suffix comes from its

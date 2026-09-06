@@ -46,6 +46,15 @@ class RepositoryHygieneTest(unittest.TestCase):
         self.assertNotIn(secret, result.stdout + result.stderr)
         self.assertNotIn(personal_path, result.stdout + result.stderr)
 
+    def test_manager_local_device_bindings_cannot_be_added_to_git(self):
+        path = self.root / 'host/.local/devices.json'
+        path.parent.mkdir()
+        path.write_text('{"version":1,"devices":[]}\n')
+        self.git('add', 'host/.local/devices.json')
+        result = self.run_check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('generated artifact or private backup', result.stderr)
+
     def test_index_secret_is_detected_after_working_copy_is_cleaned_or_deleted(self):
         path = self.root / "settings.md"
         secret = "github_pat_" + "b" * 40

@@ -85,7 +85,8 @@ cat <<'EOF'
 JUFF is ready on this Mac.
 
 1. On the ESP32, open the Bluetooth panel and choose PAIR A NEW MAC.
-2. Start JUFF with: make start
-3. Open the dashboard at http://127.0.0.1:3101/
-4. Stop all Mac services with Ctrl-C in the same terminal.
+2. Open the JUFF service manager with: make admin
+3. Visit http://127.0.0.1:3210/ and configure each device's Bluetooth name.
+4. Start the desired services from the dashboard. Ctrl-C closes the manager
+   and the services it started. The original make start command also remains.
 EOF

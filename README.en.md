@@ -69,6 +69,28 @@ without remaining-capacity calibration for the installed cell.
 
 *Small-display charging preview; the large display omits unsupported battery readings.*
 
+## WebUI service dashboard
+
+Run `make admin` and open <http://127.0.0.1:3210/> on the Mac to manage the
+gateway and device connections. The desktop widescreen layout places service
+controls beside device information. It shares JUFF's soft colors and abstract
+expressions, with separate profiles for both screen sizes.
+
+<img src="docs/images/juff-admin-overview.jpg" alt="JUFF service dashboard showing process controls, both device profiles and recent events with demonstration data" width="1000">
+
+*1600×900 (16:9) desktop browser capture. Bluetooth names, process IDs, connection states, battery readings and logs are synthetic examples, not physical-device test results.*
+
+| Page | Controls and information |
+| --- | --- |
+| Overview (服务总览) | Gateway and per-device service status, model, process ID, uptime and individual start/stop/restart controls |
+| Devices (我的设备) | Separate Bluetooth bindings, ports and sessions; connected device firmware, small-screen battery and audio metrics |
+| Logs (运行日志) | Recent connection, lifecycle and error events, filterable by service and text |
+
+Opening the dashboard leaves voice services stopped. Start All launches the
+gateway and bound BLE devices; Wi-Fi bridges can be started individually.
+Stopping or restarting the gateway also handles its managed connection workers.
+See the [UI guide and widescreen preview](docs/service-manager.md#界面导览).
+
 ## Set up a new Mac
 
 You need working Bluetooth, Xcode Command Line Tools, a DashScope API key, and
@@ -91,9 +113,19 @@ On JUFF, open the Bluetooth panel and choose **PAIR A NEW MAC**. Enter the
 six-digit code shown by the device in the macOS pairing dialog, then run:
 
 ```bash
-make start
+make admin
 ```
 
+Open <http://127.0.0.1:3210/> for the JUFF service dashboard. Add each device's
+Bluetooth name under Devices, then start its connection service. The dashboard
+starts independently and leaves voice services stopped until requested. It
+provides per-service start/stop/restart, device and battery status, audio metrics,
+bounded operational logs, and separate profiles for both screen sizes. Local
+bindings are saved privately in `host/.local/devices.json` and excluded from Git.
+Externally started gateways and bridges are observed without taking ownership.
+See the [service manager guide](docs/service-manager.md).
+
+The original `make start` command remains available to start voice directly.
 Open <http://127.0.0.1:3101/> for the Qwen Audio Agent WebUI. Press `Ctrl-C`
 in the terminal to stop all Mac services. Run `make doctor` to diagnose a
 new installation.

@@ -26,6 +26,10 @@ function httpUrl(value, name) {
 }
 
 export function readConfig(env = process.env) {
+  const serviceMode = env.JUFF_SERVICE_MODE || 'all'
+  if (!['all', 'ble', 'bridge'].includes(serviceMode)) {
+    throw new Error('JUFF_SERVICE_MODE must be all, ble, or bridge')
+  }
   const deviceToken = String(env.JUFF_DEVICE_TOKEN || '')
   if (
     deviceToken.length < 16
@@ -40,6 +44,7 @@ export function readConfig(env = process.env) {
   }
 
   return {
+    serviceMode,
     bleDevice: String(env.JUFF_BLE_DEVICE || '').trim(),
     bridgeHost: String(env.JUFF_BRIDGE_HOST || '127.0.0.1'),
     bridgePort: integer(env.JUFF_BRIDGE_PORT, 8765, 'JUFF_BRIDGE_PORT'),

@@ -11,8 +11,9 @@
   },
   "scripts": {
     "start": "node --env-file=.env src/run.mjs",
+    "admin": "node --env-file-if-exists=.env src/admin.mjs",
     "bridge": "node --env-file=.env src/index.mjs",
-    "test": "node --test",
+    "test": "node --test test/*.test.mjs",
     "ble:build": "../scripts/build_macos_ble.sh",
     "ble:test": "../macos/build/JuffBLE.app/Contents/MacOS/JuffBLE --self-test",
     "doctor": "../scripts/doctor_macos.sh",

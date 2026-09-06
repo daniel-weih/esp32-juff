@@ -1,4 +1,4 @@
-.PHONY: setup doctor start test repo-check ble-build ble-test firmware-setup firmware-build firmware-build-35 firmware-build-154 firmware-build-all firmware-package firmware-flash firmware-tools-test
+.PHONY: setup doctor start admin test repo-check ble-build ble-test firmware-setup firmware-build firmware-build-35 firmware-build-154 firmware-build-all firmware-package firmware-flash firmware-tools-test
 
 PYTHON ?= python3
 export JUFF_BOARD
@@ -11,6 +11,9 @@ doctor:
 
 start:
 	cd host && npm start
+
+admin:
+	cd host && npm run admin
 
 test: repo-check
 	$(MAKE) firmware-tools-test
