@@ -54,9 +54,10 @@ menu "Juff voice terminal"
         config JUFF_WAKE_WORD
             bool "Offline wake word and selectable conversation mode"
             default y
-            select SR_WN_WN9_NIHAOXIAOZHI_TTS
+            select SR_WN_WN9_HIMIAOMIAO_TTS
+            select SR_WN_WN9_MIAOMIAOTONGXUE_TTS
             help
-                Adds local WakeNet detection of Ni Hao Xiao Zhi on both boards.
+                Listens locally for both Hi Miao Miao and Miao Miao Tong Xue.
                 The device keeps its continuous mode until the user changes it.
                 Flash the model partition together with the application.
 

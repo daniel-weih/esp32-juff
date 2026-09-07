@@ -5,7 +5,18 @@ All notable changes to JUFF are documented here. The project follows
 
 ## [Unreleased]
 
-Current firmware development version: `0.7.0-dev`.
+Current firmware development version: `0.7.1-dev`.
+
+### 0.7.1-dev dual wake phrases
+
+- Listen locally for both “Hi，喵喵” and “喵喵同学” on either board, using the
+  two bundled WakeNet9 models. Replace the previous “你好小智” wake phrase.
+- Gate and rearm both detectors together. Require both models at boot and in
+  firmware packages; fail closed on partial initialization or reset failure.
+- Keep LIVE mode, the three-minute conversation timeout and existing audio
+  transport. Update both screen hints, UI previews and the WebUI Miaomiao preset.
+- Preserve existing assistant profiles; changing the default template does not
+  overwrite a user's saved prompt.
 
 ### 0.7.0-dev voice wake mode
 

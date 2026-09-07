@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
-import { AssistantProfileStore, resolveAssistantFile, XIAOZHI_PROFILE } from '../src/manager/assistant.mjs'
+import { AssistantProfileStore, resolveAssistantFile, MIAOMIAO_PROFILE } from '../src/manager/assistant.mjs'
 
 async function fixture(t) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'juff-assistant-'))
@@ -20,7 +20,7 @@ test('profile reads are side-effect free; saves are private, durable and retain 
   assert.equal(original.content, '')
   assert.deepEqual(await readdir(directory), [])
   const first = await store.save({ content: '你叫测试伙伴。', revision: original.revision })
-  const second = await store.save({ content: XIAOZHI_PROFILE, revision: first.revision })
+  const second = await store.save({ content: MIAOMIAO_PROFILE, revision: first.revision })
   assert.equal((await store.read()).revision, second.revision)
   assert.equal(await readFile(store.file + '.previous', 'utf8'), first.content)
   await store.save({ content: second.content, revision: second.revision })
@@ -64,19 +64,19 @@ test('path resolution follows installed Qwen config/env precedence without initi
 
 test('the installed Qwen voice instructions consume and reload the saved profile, keeping core rules', async t => {
   const { store, directory } = await fixture(t)
-  await store.save({ content: XIAOZHI_PROFILE, revision: (await store.read()).revision })
+  await store.save({ content: MIAOMIAO_PROFILE, revision: (await store.read()).revision })
   const moduleURL = new URL('../node_modules/qwen-audio-agent/server/src/voice/frontend-tools.mjs', import.meta.url)
   const script = `import assert from 'node:assert/strict';
     import { writeFileSync } from 'node:fs';
     import { buildFrontendInstructions } from ${JSON.stringify(moduleURL.href)};
     const first = buildFrontendInstructions();
-    assert.ok(first.includes('默认昵称叫“小智”'));
+    assert.ok(first.includes('默认昵称叫“喵喵”'));
     assert.ok(first.includes('# Permission requests'));
     assert.ok(first.includes('<assistant_profile authority="persona_only">'));
     writeFileSync(process.env.QWEN_AUDIO_AGENT_ASSISTANT_PROFILE_PATH, '默认昵称叫“小舟”。');
     const next = buildFrontendInstructions();
     assert.ok(next.includes('默认昵称叫“小舟”'));
-    assert.ok(!next.includes('默认昵称叫“小智”'));
+    assert.ok(!next.includes('默认昵称叫“喵喵”'));
     console.log('installed Qwen profile contract OK');`
   const output = execFileSync(process.execPath, ['--input-type=module', '-e', script], {
     cwd: fileURLToPath(new URL('..', import.meta.url)), encoding: 'utf8',

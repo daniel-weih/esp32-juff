@@ -275,7 +275,7 @@ print(json.dumps(rows))
             PACKAGER.package_firmware(self.root, board)
         model = build / "srmodels/srmodels.bin"
         model.parent.mkdir()
-        model.write_bytes(b"synthetic wn9_nihaoxiaozhi_tts\0 model fixture")
+        model.write_bytes(b"synthetic wn9_himiaomiao_tts\0 wn9_miaomiaotongxue_tts\0 model fixture")
         flasher_path = build / "flasher_args.json"
         flasher = json.loads(flasher_path.read_text())
         flasher["flash_files"]["0x420000"] = "srmodels/srmodels.bin"
@@ -286,8 +286,14 @@ print(json.dumps(rows))
             image = next(image for image in manifest["images"] if image["role"] == "model")
             self.assertEqual(image["offset"], "0x420000")
             self.assertEqual(image["sha256"], hashlib.sha256(model.read_bytes()).hexdigest())
-            self.assertEqual(manifest["features"]["wake_word"], "你好小智")
+            self.assertEqual(manifest["features"]["wake_word"], "Hi，喵喵")
+            self.assertEqual(manifest["features"]["wake_words"], ["Hi，喵喵", "喵喵同学"])
             self.assertIn(image["file"], bundle.read(f"{board}/flash_args").decode())
+        for incomplete in (b"wn9_himiaomiao_tts\0", b"wn9_miaomiaotongxue_tts\0", b"wn9_nihaoxiaozhi_tts\0"):
+            with self.subTest(incomplete=incomplete):
+                model.write_bytes(incomplete)
+                with self.assertRaisesRegex(ValueError, "both matching WakeNet models"):
+                    PACKAGER.package_firmware(self.root, board)
 
     def test_wrong_hardware_or_private_config_cannot_be_packaged(self):
         board = BOARDS[1]

@@ -77,7 +77,7 @@ without remaining-capacity calibration for the installed cell.
 
 Tap **LIVE / WAKE** on either device to choose continuous conversation or offline
 wake-word mode. The choice persists across reboots; LIVE remains the default.
-In WAKE mode, say **“你好小智” (nǐ hǎo xiǎo zhì)** and wait for **“我在”** (“I'm here”)
+In WAKE mode, say **“Hi，喵喵” (hi miao miao)** or **“喵喵同学” (miao miao tong xue)** and wait for **“我在”** (“I'm here”)
 before asking a question. This cached local greeting plays when cloud voice input
 is ready. After **3 minutes without conversation**, the voice session
 closes and requires another wake word. Standby microphone audio stays on-device.
@@ -108,15 +108,16 @@ guide for initial takeover policy and recovery behavior.
 | --- | --- |
 | Overview (服务总览) | Gateway and per-device service status, model, process ID, uptime and individual start/stop/restart controls |
 | Devices (我的设备) | Separate Bluetooth bindings, ports and sessions; connected device firmware, small-screen battery and audio metrics |
-| Assistant (助手设定) | Edit Qwen's default name, personality and speaking style; fill the Xiaozhi preset, save, or save and reconnect active device services |
+| Assistant (助手设定) | Edit Qwen's default name, personality and speaking style; fill the Miaomiao preset, save, or save and reconnect active device services |
 | Logs (运行日志) | Recent connection, lifecycle and error events, filterable by service and text |
 
 Opening the dashboard leaves voice services stopped. Start All launches the
 gateway and bound BLE devices; Wi-Fi bridges can be started individually.
 Stopping or restarting the gateway also handles its managed connection workers.
 Assistant settings use Qwen's private local `ASSISTANT.md` and apply to new voice
-sessions on both devices. The preset accepts “Xiaozhi” as the assistant's nickname
-while acknowledging Qwen as its technology; the firmware wake phrase stays unchanged.
+sessions on both devices. The preset accepts “Miaomiao” as the assistant's nickname
+while acknowledging Qwen as its technology. Editing the preset does not change the
+firmware wake phrases.
 See the [UI guide and widescreen preview](docs/service-manager.md#界面导览).
 
 ## Set up a new Mac

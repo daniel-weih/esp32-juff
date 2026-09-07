@@ -17,7 +17,7 @@
 #define VAD_MODE_3 3
 #define VAD_SPEECH 1
 typedef void *vad_handle_t;
-typedef struct {} model_iface_data_t;
+typedef struct { unsigned index; bool live; } model_iface_data_t;
 typedef struct {} srmodel_list_t;
 typedef struct {
     model_iface_data_t *(*create)(const void *, int);
@@ -31,9 +31,11 @@ typedef struct {
 static voice_session_status_t state = { .mode = VOICE_MODE_WAKE, .generation = 1,
     .connected = true, .acknowledged = true };
 static int64_t time_us;
-static bool trigger, missing, reset_failure;
+static unsigned trigger;
+static bool missing, missing_second, mismatch, reset_failure, second_reset_failure;
 static unsigned detections, wakes, activity, creates, destroys, silent_checks;
-static model_iface_data_t model_data;
+static unsigned checked[2], calls[2];
+static model_iface_data_t model_data[2] = {{.index = 0}, {.index = 1}};
 static srmodel_list_t models;
 voice_session_status_t voice_session_get(void) { return state; }
 void voice_session_set_supported(bool supported) { state.supported = supported; }
@@ -43,24 +45,41 @@ static int64_t esp_timer_get_time(void) { return time_us; }
 static void *heap_caps_malloc(size_t size, unsigned caps) { return malloc(size); }
 static srmodel_list_t *esp_srmodel_init(const char *partition) { return missing ? NULL : &models; }
 static void esp_srmodel_deinit(srmodel_list_t *list) {}
-static char *esp_srmodel_filter(srmodel_list_t *list, const char *a, const char *b) { return "wn9_nihaoxiaozhi_tts"; }
+static char *esp_srmodel_filter(srmodel_list_t *list, const char *a, const char *b)
+{
+    assert(!strcmp(a, "wn9_"));
+    if (!strcmp(b, "himiaomiao_tts")) return "wn9_himiaomiao_tts";
+    assert(!strcmp(b, "miaomiaotongxue_tts"));
+    return missing_second ? NULL : "wn9_miaomiaotongxue_tts";
+}
 static model_iface_data_t *create(const void *name, int mode)
-{ ++creates; return reset_failure ? NULL : &model_data; }
+{
+    ++creates;
+    const unsigned index = !strcmp(name, "wn9_himiaomiao_tts") ? 0 : 1;
+    assert(!model_data[index].live);
+    if (reset_failure || (second_reset_failure && index == 1)) return NULL;
+    model_data[index].live = true;
+    return &model_data[index];
+}
 static int rate(model_iface_data_t *data) { return 16000; }
 static int channels(model_iface_data_t *data) { return 1; }
-static int chunk(model_iface_data_t *data) { return 320; }
+static int chunk(model_iface_data_t *data) { return mismatch && data->index == 1 ? 480 : 320; }
 static void clean(model_iface_data_t *data) { assert(false && "WakeNet9 clean crashes on this pinned library"); }
-static void destroy(model_iface_data_t *data) { assert(data == &model_data); ++destroys; }
+static void destroy(model_iface_data_t *data)
+{ assert(data == &model_data[data->index] && data->live); data->live = false; ++destroys; }
 static int detect(model_iface_data_t *data, int16_t *pcm)
 {
-    if (!silent_checks) {
+    assert(data->live);
+    if (!checked[data->index]) {
         for (unsigned i = 0; i < 320; ++i) assert(pcm[i] == 0);
         ++silent_checks;
+        ++checked[data->index];
         return 0;
     }
     ++detections;
+    ++calls[data->index];
     for (unsigned i = 0; i < 320; ++i) assert(pcm[i] == (int16_t)(i * 9 - 1200));
-    return trigger;
+    return (trigger & (1U << data->index)) != 0;
 }
 static const esp_wn_iface_t model = { create, rate, channels, chunk, clean, destroy, detect };
 static const esp_wn_iface_t *esp_wn_handle_from_name(const char *name) { return &model; }
@@ -75,46 +94,66 @@ int main(int argc, char **argv)
 {
     assert(argc == 2);
     missing = !strcmp(argv[1], "missing");
+    missing_second = !strcmp(argv[1], "missing-second");
+    mismatch = !strcmp(argv[1], "mismatch");
+    second_reset_failure = !strcmp(argv[1], "second-create-failure");
     int16_t mono[480], stereo[960];
     for (unsigned i = 0; i < 480; ++i) {
         mono[i] = stereo[i * 2] = (int16_t)(i * 6 - 1200);
         stereo[i * 2 + 1] = 28000;
     }
     const int result = wake_word_init();
-    if (missing) {
+    if (missing || missing_second || mismatch || second_reset_failure) {
         assert(result != ESP_OK && !state.supported);
         assert(wake_word_process(mono, 480, 1, false, false));
         assert(!wake_word_process(mono, 480, 1, false, true));
         assert(!state.active && !wakes && !detections);
+        assert(!model_data[0].live && !model_data[1].live);
     } else {
         assert(result == ESP_OK && state.supported);
         if (!strcmp(argv[1], "reset")) {
-            assert(silent_checks == 1 && creates == 2 && destroys == 1);
+            assert(silent_checks == 2 && creates == 4 && destroys == 2);
             assert(wake_word_process(mono, 480, 1, false, false));
-            assert(creates == 2 && destroys == 1 && detections == 1);
+            assert(creates == 4 && destroys == 2 && detections == 2);
             for (unsigned i = 0; i < 10; ++i) wake_word_reset();
             state.acknowledged = false;
             assert(wake_word_process(mono, 480, 1, false, false));
-            assert(creates == 2 && destroys == 1);
+            assert(creates == 4 && destroys == 2);
             state.acknowledged = true;
             assert(wake_word_process(mono, 480, 1, false, false));
-            assert(creates == 3 && destroys == 2 && detections == 2);
+            assert(creates == 6 && destroys == 4 && detections == 4);
             ++state.generation;
             reset_failure = true;
             assert(wake_word_process(mono, 480, 1, false, false));
-            assert(!state.supported && !wakes && creates == 4 && destroys == 3);
+            assert(!state.supported && !wakes && creates == 7 && destroys == 6);
+            assert(!model_data[0].live && !model_data[1].live);
             assert(wake_word_process(mono, 480, 1, false, false));
             assert(!wake_word_process(mono, 480, 1, false, true));
         } else if (!strcmp(argv[1], "routing")) {
             assert(wake_word_process(mono, 480, 1, false, false));
             assert(wake_word_process(stereo, 480, 2, false, false));
-            assert(detections == 2 && !wakes);
-        } else if (!strcmp(argv[1], "wake")) {
-            trigger = true;
+            assert(detections == 4 && calls[0] == 2 && calls[1] == 2 && !wakes);
+        } else if (!strcmp(argv[1], "wake") || !strcmp(argv[1], "wake-second")
+                   || !strcmp(argv[1], "wake-both")) {
+            trigger = !strcmp(argv[1], "wake-second") ? 2 : !strcmp(argv[1], "wake-both") ? 3 : 1;
             assert(wake_word_process(stereo, 480, 2, false, false));
             assert(wakes == 1 && state.active);
             assert(!wake_word_process(stereo, 480, 2, false, false));
-            assert(detections == 1);
+            assert(detections == (trigger == 2 ? 2U : 1U));
+            // A fresh conversation boundary rearms both detectors, including
+            // the detector skipped after the first phrase matched.
+            state.active = false;
+            ++state.generation;
+            trigger = trigger == 2 ? 1 : 2;
+            assert(wake_word_process(stereo, 480, 2, false, false));
+            assert(wakes == 2 && state.active && creates == 6);
+        } else if (!strcmp(argv[1], "reset-second-failure")) {
+            assert(wake_word_process(mono, 480, 1, false, false));
+            ++state.generation;
+            second_reset_failure = true;
+            assert(wake_word_process(mono, 480, 1, false, false));
+            assert(!state.supported && !wakes);
+            assert(!model_data[0].live && !model_data[1].live);
         } else if (!strcmp(argv[1], "gates")) {
             assert(wake_word_process(mono, 480, 1, true, false));
             time_us = 799999;
@@ -122,7 +161,7 @@ int main(int argc, char **argv)
             assert(!detections);
             time_us = 800000;
             assert(wake_word_process(mono, 480, 1, false, false));
-            assert(detections == 1);
+            assert(detections == 2);
             assert(!wake_word_process(mono, 480, 1, false, true));
             time_us += 800000;
             state.acknowledged = false;
@@ -130,7 +169,7 @@ int main(int argc, char **argv)
             state.acknowledged = true;
             state.connected = false;
             assert(wake_word_process(mono, 480, 1, false, false));
-            assert(detections == 1 && !wakes);
+            assert(detections == 2 && !wakes);
         } else if (!strcmp(argv[1], "activity")) {
             state.active = true;
             int16_t voice[160];
@@ -144,6 +183,7 @@ int main(int argc, char **argv)
             wake_word_observe_activity((uint8_t *)voice, sizeof(voice));
             assert(activity == 1);
         } else assert(false);
+        destroy_models();
         free(s_frame);
     }
     puts("Wake routing passed");

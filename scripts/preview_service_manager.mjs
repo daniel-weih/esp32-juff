@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url'
 import { createManagerServer } from '../host/src/manager/server.mjs'
 import { ManagerError, validateProfiles } from '../host/src/manager/profiles.mjs'
 import { LogStore } from '../host/src/manager/logs.mjs'
-import { XIAOZHI_PROFILE, MAX_ASSISTANT_CHARS } from '../host/src/manager/assistant.mjs'
+import { MIAOMIAO_PROFILE, MAX_ASSISTANT_CHARS } from '../host/src/manager/assistant.mjs'
 
 const port = Number(process.argv[2] || 3211)
 if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('Preview port must be 1024–65535')
@@ -33,7 +33,7 @@ const manager = {
   async close() {},
   async command() { throw new ManagerError('这是只读界面预览，请使用 make admin 管理实际服务', 409) },
   async updateProfiles() { throw new ManagerError('演示设备配置为只读', 409) },
-  async readAssistant() { return { content: XIAOZHI_PROFILE, template: XIAOZHI_PROFILE, maxChars: MAX_ASSISTANT_CHARS, revision: 'demo', local: true, canReconnect: false } },
+  async readAssistant() { return { content: MIAOMIAO_PROFILE, template: MIAOMIAO_PROFILE, maxChars: MAX_ASSISTANT_CHARS, revision: 'demo', local: true, canReconnect: false } },
   async saveAssistant() { throw new ManagerError('演示助手设定为只读', 409) },
   snapshot() {
     const now = Date.now()
@@ -48,7 +48,7 @@ const manager = {
         ...service(`${device.id}-ble`, 'ble', '蓝牙语音', device.id),
         state: 'running', pid: 42002 + index, owned: true, startedAt,
         connected: true, voiceReady: true, bleState: 'audio-connected',
-        device: { firmware: '0.6.10-dev', board: device.board, playing: false,
+        device: { firmware: '0.7.1-dev', board: device.board, playing: false,
           battery: index === 0 ? { valid: true, percent: 78, charging: false } : null, seenAt: now },
         metrics: { fps: 10, kibPerSecond: 31.3, at: now },
       })

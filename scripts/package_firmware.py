@@ -66,8 +66,9 @@ def package_firmware(project_root, board_id):
     wake_word = bool(config.get("JUFF_WAKE_WORD"))
     if wake_word:
         model = next((image for image in images if image["role"] == "model"), None)
-        if model is None or b"wn9_nihaoxiaozhi_tts\0" not in files[model["file"]]:
-            raise ValueError("Wake-word firmware requires the matching WakeNet model image")
+        required_models = (b"wn9_himiaomiao_tts\0", b"wn9_miaomiaotongxue_tts\0")
+        if model is None or not all(name in files[model["file"]] for name in required_models):
+            raise ValueError("Wake-word firmware requires both matching WakeNet models")
 
     # Resolve every license before touching an existing export or its archive.
     files.update(collect_firmware_licenses(project_root, build))
@@ -79,7 +80,8 @@ def package_firmware(project_root, board_id):
                 "features": {"voice_interrupt": voice_interrupt,
                              "acoustic_echo_cancellation": voice_interrupt,
                              "aec_reference": aec_reference,
-                             "wake_word": "你好小智" if wake_word else None,
+                             "wake_word": "Hi，喵喵" if wake_word else None,
+                             "wake_words": ["Hi，喵喵", "喵喵同学"] if wake_word else [],
                              "conversation_idle_seconds": 180 if wake_word else None},
                 "flash_settings": flasher["flash_settings"], "images": images}
     files["manifest.json"] = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode()

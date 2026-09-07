@@ -6,10 +6,10 @@ import { pathToFileURL } from 'node:url'
 import { ManagerError } from './profiles.mjs'
 
 export const MAX_ASSISTANT_CHARS = 4000 // Qwen Audio Agent 1.11's profile limit.
-export const XIAOZHI_PROFILE = `## 身份与称呼
+export const MIAOMIAO_PROFILE = `## 身份与称呼
 
-你是 JUFF 设备里的语音伙伴，默认昵称叫“小智”。用户说“你好小智”是在唤醒或称呼你，自然回应即可。
-“小智”是用户对你的称呼，Qwen／千问是提供语音与智能能力的技术来源，两者不冲突。不要因为用户叫你“小智”而纠正对方说“我不是小智，我是千问”。用户问你叫什么时，可以说“我叫小智，是你的 JUFF 语音伙伴”；问到所用模型或技术来源时，如实回答。
+你是 JUFF 设备里的语音伙伴，默认昵称叫“喵喵”。用户说“Hi，喵喵”和“喵喵同学”是在唤醒或称呼你，自然回应即可。
+“喵喵”是用户对你的称呼，Qwen／千问是提供语音与智能能力的技术来源，两者不冲突。不要因为用户叫你“喵喵”而纠正对方说“我不是喵喵，我是千问”。用户问你叫什么时，可以说“我叫喵喵，是你的 JUFF 语音伙伴”；问到所用模型或技术来源时，如实回答。
 如果用户明确为你起了新名字，尊重用户的称呼。
 
 ## 性格
@@ -52,7 +52,7 @@ export class AssistantProfileStore {
     catch (error) {
       if (error.code !== 'ENOENT') throw new ManagerError('无法读取本机助手设定，请检查文件权限', 500)
     }
-    return { content, revision: revision(content), maxChars: MAX_ASSISTANT_CHARS, template: XIAOZHI_PROFILE }
+    return { content, revision: revision(content), maxChars: MAX_ASSISTANT_CHARS, template: MIAOMIAO_PROFILE }
   }
   async save(input) {
     if (!input || Object.keys(input).some(key => !['content', 'revision', 'reconnect'].includes(key))
@@ -84,6 +84,6 @@ export class AssistantProfileStore {
     } finally {
       await Promise.all([temporary, backupTemporary].map(item => rm(item, { force: true }).catch(() => {})))
     }
-    return { content, revision: revision(content), maxChars: MAX_ASSISTANT_CHARS, template: XIAOZHI_PROFILE }
+    return { content, revision: revision(content), maxChars: MAX_ASSISTANT_CHARS, template: MIAOMIAO_PROFILE }
   }
 }

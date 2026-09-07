@@ -700,7 +700,7 @@ static void refresh_status_ui(void)
         title = !conversation.supported ? "wake unavailable." : "say hello.";
         detail = !conversation.supported ? "tap WAKE to change mode"
             : !conversation.acknowledged ? "open the updated Mac service"
-            : "say \"ni hao xiao zhi\"";
+            : "hi miao miao /\nmiao miao tong xue";
     } else if (!voice_ready) {
         mood = bridge_connected || ble_connected ? COMPANION_MOOD_THINKING
                                                 : COMPANION_MOOD_DOZING;
@@ -739,6 +739,17 @@ static void refresh_status_ui(void)
                                                  : LV_SYMBOL_STOP "  stop")
         : waiting ? LV_SYMBOL_SETTINGS "  voice mode" : LV_SYMBOL_BLUETOOTH "  connection";
     set_label_text(s_main_title, title);
+    if (UI_COMPACT) {
+        const bool two_line_hint = strchr(detail, '\n') != NULL;
+        const int detail_height = two_line_hint ? 30 : 16;
+        if (lv_obj_get_height(s_main_detail) != detail_height) {
+            lv_obj_set_height(s_face, two_line_hint ? 98 : 106);
+            lv_obj_set_y(s_main_title, two_line_hint ? 142 : 150);
+            lv_obj_set_y(s_main_detail, two_line_hint ? 168 : 179);
+            lv_obj_set_height(s_main_detail, detail_height);
+            lv_label_set_long_mode(s_main_detail, two_line_hint ? LV_LABEL_LONG_WRAP : LV_LABEL_LONG_DOT);
+        }
+    }
     set_label_text(s_main_detail, detail);
     set_label_text(s_primary_button_label, action);
     lv_obj_set_style_bg_color(s_primary_button,
@@ -866,7 +877,7 @@ static void primary_clicked(lv_event_t *event)
     const bool ble_voice_active = ble_manager_is_voice_active();
     const bool voice_ready = ble_voice_active || device_client_is_voice_active();
     if (voice_session_waiting()) {
-        board_display_set_notice("Say hello to wake me", "ni hao xiao zhi", 1800);
+        board_display_set_notice("Hi, miao miao", "or miao miao tong xue", 1800);
         return;
     }
     const bool can_interrupt = audio_io_is_playing()
@@ -1164,7 +1175,7 @@ static void create_ui(void)
     create_button(mode_sheet, UI_COMPACT ? 182 : 232, UI_COMPACT ? 6 : 12,
                   36, 36, LV_SYMBOL_CLOSE, COLOR_SURFACE, mode_close_clicked);
     lv_obj_t *mode_detail = make_label(mode_sheet,
-        "Wake word: ni hao xiao zhi\nBack to sleep after 3 quiet minutes.",
+        "hi miao miao /\nmiao miao tong xue\nSleep after 3 quiet minutes.",
         UI_COMPACT ? &lv_font_montserrat_12 : &lv_font_montserrat_14, COLOR_MUTED);
     place(mode_detail, inner, UI_COMPACT ? 58 : 88, content_width, UI_COMPACT ? 45 : 64);
     lv_label_set_long_mode(mode_detail, LV_LABEL_LONG_WRAP);

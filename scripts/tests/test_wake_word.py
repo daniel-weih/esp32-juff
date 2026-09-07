@@ -31,10 +31,16 @@ class WakeWordTest(unittest.TestCase):
 
     def test_both_channel_layouts_feed_only_resampled_microphone(self): self.case("routing")
     def test_detected_phrase_is_discarded_and_detector_stops_during_conversation(self): self.case("wake")
+    def test_second_phrase_wakes_without_first_phrase(self): self.case("wake-second")
+    def test_two_matches_create_only_one_conversation_and_both_rearm(self): self.case("wake-both")
     def test_playback_tail_diagnostics_and_unacknowledged_transport_cannot_wake(self): self.case("gates")
     def test_missing_model_does_not_open_the_microphone(self): self.case("missing")
+    def test_missing_second_model_does_not_advertise_partial_support(self): self.case("missing-second")
+    def test_different_model_frame_sizes_fail_closed(self): self.case("mismatch")
+    def test_second_model_creation_failure_releases_first_model(self): self.case("second-create-failure")
     def test_activity_vad_does_not_extend_timer_for_low_energy_noise(self): self.case("activity")
     def test_model_reset_recreates_once_and_failure_keeps_standby_silent(self): self.case("reset")
+    def test_second_model_reset_failure_releases_both_models(self): self.case("reset-second-failure")
 
 
 if __name__ == "__main__": unittest.main()
