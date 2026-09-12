@@ -36,9 +36,9 @@ test('managed BLE worker keeps multiline transcripts out of operational logs', {
     await new Promise(resolve => server.close(resolve))
     await rm(root, { recursive: true, force: true })
   })
-  await mkdir(path.join(host, 'src'), { recursive: true })
+  await mkdir(path.join(host, 'src/manager'), { recursive: true })
   await mkdir(bleDirectory, { recursive: true })
-  for (const name of ['run.mjs', 'config.mjs', 'device-bridge.mjs', 'gateway-client.mjs', 'conversation-client.mjs', 'playback-diagnostics.mjs', 'wake-acknowledgement.mjs']) {
+  for (const name of ['run.mjs', 'config.mjs', 'device-bridge.mjs', 'gateway-client.mjs', 'conversation-client.mjs', 'playback-diagnostics.mjs', 'wake-acknowledgement.mjs', 'manager/assistant.mjs', 'manager/profiles.mjs']) {
     await copyFile(new URL(`../src/${name}`, import.meta.url), path.join(host, 'src', name))
   }
   await mkdir(path.join(host, 'assets'))

@@ -46,6 +46,19 @@ test('invalid edits and stale browser revisions preserve the saved profile', asy
   assert.equal((await store.read()).content, '在文件中修改')
 })
 
+test('first startup installs Miaomiao atomically and preserves existing profiles on later startups', async t => {
+  const { store } = await fixture(t)
+  const results = await Promise.all([store.initializeDefault(), store.initializeDefault()])
+  assert.deepEqual(results.sort(), [false, true])
+  assert.equal((await store.read()).content, MIAOMIAO_PROFILE)
+  assert.equal((await stat(store.file)).mode & 0o777, 0o600)
+  assert.deepEqual(await readdir(path.dirname(store.file)), ['ASSISTANT.md'])
+  await store.save({ content: '你叫小舟。', revision: (await store.read()).revision })
+  assert.equal(await store.initializeDefault(), false)
+  assert.equal((await store.read()).content, '你叫小舟。')
+  assert.equal(await readFile(store.file + '.previous', 'utf8'), MIAOMIAO_PROFILE)
+})
+
 test('path resolution follows installed Qwen config/env precedence without initializing user data', async t => {
   const { directory } = await fixture(t)
   const runtimeRoot = path.join(directory, 'runtime'), data = path.join(directory, 'data')

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { link, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -45,6 +45,24 @@ export async function resolveAssistantFile(env = process.env) {
 export class AssistantProfileStore {
   constructor({ env = process.env, file } = {}) { this.env = env; this.file = file }
   async location() { return this.file || resolveAssistantFile(this.env) }
+  async initializeDefault() {
+    const file = await this.location()
+    try { await readFile(file); return false }
+    catch (error) { if (error.code !== 'ENOENT') throw error }
+    await mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
+    const temporary = `${file}.${randomUUID()}.tmp`
+    try {
+      await writeFile(temporary, MIAOMIAO_PROFILE, { mode: 0o600, flag: 'wx' })
+      // Publish the complete profile without replacing a concurrent user save.
+      await link(temporary, file)
+      return true
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error
+      return false
+    } finally {
+      await rm(temporary, { force: true })
+    }
+  }
   async read(file) {
     file ||= await this.location()
     let content = ''

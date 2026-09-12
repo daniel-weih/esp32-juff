@@ -118,6 +118,9 @@ Assistant settings use Qwen's private local `ASSISTANT.md` and apply to new voic
 sessions on both devices. The preset accepts “Miaomiao” as the assistant's nickname
 while acknowledging Qwen as its technology. Editing the preset does not change the
 firmware wake phrases.
+Setup and local gateway startup create the Miaomiao profile when no saved
+`ASSISTANT.md` exists. Existing profiles are preserved; apply the preset in the
+dashboard to switch an older installation, then reconnect its voice services.
 See the [UI guide and widescreen preview](docs/service-manager.md#界面导览).
 
 ## Set up a new Mac

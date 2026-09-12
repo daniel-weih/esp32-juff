@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import { ProfileStore } from '../src/manager/profiles.mjs'
 import { ServiceManager } from '../src/manager/services.mjs'
+import { AssistantProfileStore } from '../src/manager/assistant.mjs'
 
 test('real owned worker and its BLE descendant exit while the shared gateway stays alive', { timeout: 15000 }, async t => {
   const reservation = net.createServer().listen(0, '127.0.0.1')
@@ -23,6 +24,7 @@ test('real owned worker and its BLE descendant exit while the shared gateway sta
   await store.save(store.list().map(item => ({ ...item, bleName: `JUFF-${item.id}` })))
   const worker = fileURLToPath(new URL('./fixtures/managed-worker.mjs', import.meta.url))
   const manager = new ServiceManager({ root, store, checkFiles: false,
+    assistantStore: new AssistantProfileStore({ file: path.join(root, 'ASSISTANT.md') }),
     env: { ...process.env, JUFF_DEVICE_TOKEN: 'synthetic-device-token', QWEN_GATEWAY_URL: `http://127.0.0.1:${port}` },
     spawnImpl(executable, args, options) {
       const kind = executable.endsWith('qwenaudio') ? 'gateway' : options.env.JUFF_SERVICE_MODE

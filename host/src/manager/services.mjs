@@ -224,6 +224,7 @@ export class ServiceManager {
       if (url.protocol !== 'http:' || !['localhost', '127.0.0.1'].includes(url.hostname)) throw new ManagerError('此网关地址需要在外部启动；后台只能启动本机 HTTP 网关', 409)
       const executable = path.join(this.root, 'host/node_modules/.bin/qwenaudio')
       if (this.checkFiles && !existsSync(executable)) throw new ManagerError('Qwen 依赖未安装，请先运行 make setup', 409)
+      await this.assistantStore.initializeDefault()
       // A crashed gateway leaves workers alive with closed voice sessions.
       // Recover them for every startup entry point, including "start all".
       dependents = [...this.records.values()].filter(item => item.kind !== 'gateway' && item.child)

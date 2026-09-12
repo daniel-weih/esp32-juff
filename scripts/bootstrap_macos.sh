@@ -80,6 +80,12 @@ else
   fi
 fi
 
+echo "Initializing the default Miaomiao assistant (keeping any existing profile)"
+(cd "$project_root/host" && node --env-file=.env --input-type=module -e '
+  import { AssistantProfileStore } from "./src/manager/assistant.mjs"
+  await new AssistantProfileStore().initializeDefault()
+')
+
 cat <<'EOF'
 
 JUFF is ready on this Mac.

@@ -7,6 +7,15 @@ All notable changes to JUFF are documented here. The project follows
 
 Current firmware development version: `0.7.1-dev`.
 
+### Mac pairing and default assistant
+
+- Initialize new local assistant profiles with the Miaomiao preset during setup
+  or before starting an owned Qwen gateway. Keep existing saved profiles intact.
+- Authenticate a protected BLE control write before subscribing to audio.
+  This prevents the firmware's conversation reset from clearing the pairing
+  code while macOS is waiting for it, and reports authentication separately
+  from an audio connection. No firmware update is required for this fix.
+
 ### 0.7.1-dev dual wake phrases
 
 - Listen locally for both “Hi，喵喵” and “喵喵同学” on either board, using the

@@ -218,6 +218,7 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
     private var speakerWatchdogWorkItem: DispatchWorkItem?
     private var speakerActivity: NSObjectProtocol?
     private var readyToWrite = false
+    private var awaitingAuthentication = false
     private var writeInProgress = false
     private var controlWriteStartedAt = 0.0
     private var statusNotifying = false
@@ -362,6 +363,7 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
             self.microphoneCharacteristic = nil
             self.speakerCharacteristic = nil
             self.readyToWrite = false
+            self.awaitingAuthentication = false
             self.writeInProgress = false
             self.statusNotifying = false
             self.microphoneNotifying = false
@@ -747,17 +749,21 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
         speakerCharacteristic = service.characteristics?.first {
             $0.uuid == speakerUUID
         }
-        guard controlCharacteristic != nil,
-              let statusCharacteristic,
-              let microphoneCharacteristic,
+        guard let controlCharacteristic,
+              statusCharacteristic != nil,
+              microphoneCharacteristic != nil,
               speakerCharacteristic != nil else {
             report("characteristic-missing")
             manager.cancelPeripheralConnection(peripheral)
             return
         }
-        report("subscribing")
-        peripheral.setNotifyValue(true, for: statusCharacteristic)
-        peripheral.setNotifyValue(true, for: microphoneCharacteristic)
+        // Audio subscriptions trigger a firmware conversation reset, which clears
+        // the pairing-code notice. Authenticate a protected control write first
+        // so the code remains visible while macOS asks the user to enter it.
+        awaitingAuthentication = true
+        report("authenticating:" + (peripheral.name ?? "JUFF"))
+        peripheral.writeValue(Data("{\"type\":\"status\"}\n".utf8),
+                              for: controlCharacteristic, type: .withResponse)
     }
 
     func peripheral(
@@ -783,6 +789,24 @@ private final class JuffCentral: NSObject, CBCentralManagerDelegate, CBPeriphera
         didWriteValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        guard characteristic.uuid == controlUUID else { return }
+        if awaitingAuthentication {
+            awaitingAuthentication = false
+            if let error {
+                report("authentication-error:" + oneLine(error.localizedDescription))
+                manager.cancelPeripheralConnection(peripheral)
+                return
+            }
+            guard let statusCharacteristic, let microphoneCharacteristic else {
+                manager.cancelPeripheralConnection(peripheral)
+                return
+            }
+            report("authenticated:" + (peripheral.name ?? "JUFF"))
+            report("subscribing")
+            peripheral.setNotifyValue(true, for: statusCharacteristic)
+            peripheral.setNotifyValue(true, for: microphoneCharacteristic)
+            return
+        }
         if let error {
             writeFailed(error)
             return

@@ -6,6 +6,7 @@ import { readConfig } from './config.mjs'
 import { createDeviceBridge } from './device-bridge.mjs'
 import { ConversationClient } from './conversation-client.mjs'
 import { PlaybackDiagnostics } from './playback-diagnostics.mjs'
+import { AssistantProfileStore } from './manager/assistant.mjs'
 
 const hostDirectory = fileURLToPath(new URL('..', import.meta.url))
 const qwenExecutable = fileURLToPath(new URL('../node_modules/.bin/qwenaudio', import.meta.url))
@@ -303,6 +304,7 @@ try {
     if (config.serviceMode !== 'all') {
       throw new Error('Qwen Gateway is unavailable; start it from the JUFF manager first')
     }
+    await new AssistantProfileStore().initializeDefault()
     gateway = spawn(qwenExecutable, [], {
       cwd: hostDirectory,
       stdio: 'inherit',

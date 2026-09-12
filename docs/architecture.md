@@ -53,6 +53,13 @@ Bluetooth address. The Mac is the CoreBluetooth central.
 - One service with control, status, microphone, and speaker characteristics
 - Sensitive writes require an encrypted, authenticated connection
 
+The Mac first writes a `status` request to the protected control characteristic
+and waits for its successful GATT completion before enabling status/microphone
+notifications. This keeps the firmware's pairing-code notice visible until
+authentication completes: enabling audio early triggers a conversation boundary
+that clears transient display notices. The companion reports `authenticating`,
+then `authenticated`, then `audio-connected` after subscriptions complete.
+
 The custom service uses these UUIDs:
 
 | Purpose | UUID suffix |

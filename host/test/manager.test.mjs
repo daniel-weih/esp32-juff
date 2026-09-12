@@ -45,6 +45,7 @@ async function fixture(t, options = {}) {
     child.end()
   }
   const manager = new ServiceManager({ root, store, env: { JUFF_DEVICE_TOKEN: 'test-device-token-12345', QWEN_GATEWAY_URL: 'http://127.0.0.1:3101' },
+    assistantStore: new AssistantProfileStore({ file: path.join(root, 'ASSISTANT.md') }),
     spawnImpl, fetchImpl, signalImpl, checkFiles: false, startTimeout: 30, stopTimeout: 20, pollDelay: 1 })
   t.after(() => manager.close())
   return { manager, store, children, events, external }
@@ -68,6 +69,7 @@ test('concurrent device starts launch one shared gateway and isolated BLE worker
   const { manager, children } = await fixture(t)
   await Promise.all([manager.command('small-ble', 'start'), manager.command('large-ble', 'start'), manager.command('small-ble', 'start')])
   assert.deepEqual(children.map(child => child.kind), ['gateway', 'ble', 'ble'])
+  assert.match((await manager.assistantStore.read()).content, /默认昵称叫“喵喵”/)
   assert.equal(children[1].config.env.JUFF_BLE_DEVICE, 'JUFF-TEST0')
   assert.equal(children[2].config.env.JUFF_BLE_DEVICE, 'JUFF-TEST1')
   assert.notEqual(children[1].config.env.QWEN_SESSION_ID, children[2].config.env.QWEN_SESSION_ID)
