@@ -24,7 +24,7 @@
     "qwen:gateway": "qwenaudio"
   },
   "dependencies": {
-    "qwen-audio-agent": "1.11.0",
+    "qwen-audio-agent": "2.0.1",
     "ws": "8.21.1"
   }
 }
