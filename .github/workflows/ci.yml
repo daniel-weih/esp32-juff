@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - run: ./scripts/check_repository.sh
@@ -32,7 +32,7 @@ jobs:
       run:
         working-directory: host
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: actions/setup-node@v7
@@ -49,7 +49,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - run: ./scripts/build_macos_ble.sh
@@ -64,7 +64,7 @@ jobs:
         board: [waveshare-lcd-3.5, waveshare-lcd-1.54]
         aec: ["n", "y"]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: espressif/esp-idf-ci-action@v1
